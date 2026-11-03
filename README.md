@@ -1,44 +1,68 @@
-# GBVideoPlayer2
-A new version of [GBVideoPlayer](https://github.com/LIJI32/GBVideoPlayer) with higher resolution, 3-bit stereo PCM audio and video compression.
+# GBVideoPlayer2 for DMG
 
-Version 2 increases the horizontal resolution by up to 4, replaces the chiptune music with ~9KHz, 3-bit PCM audio, introduces simple video compression with configurable quality settings, and uses a faster and easier to use encoding routines that can directly re-encode FFMPEG-compatible video to GBVP2 format.
+A fork of [LIJI32's GBVideoPlayer2](https://github.com/LIJI32/GBVideoPlayer2) that plays silent video on the original Game Boy.
 
-## Examples
+The colour player rewrites the vertical scroll on every eighth pixel. That loop only meets the LCD if the CPU is in Game Boy Color double-speed mode, and the 528-colour figure comes from the eight background palettes plus blending on the LCD. Neither exists on the DMG. Dropping the audio track frees the vertical blank and a few instructions per line. It does not halve the pixel period. This player therefore uses a different picture format, aimed at keeping motion instead of pretending the colour image still fits.
 
-You can grab compiled example ROMs from the [releases page](https://github.com/LIJI32/GBVideoPlayer2/releases) or [watch a video](https://youtu.be/iDd_aqpLf5Q)
+## Picture
+
+- 160×144 LCD pixels, 4 shades of grey
+- Logical resolution 40×144. Each logical pixel is 4 LCD pixels wide, chosen from a complete codebook of 256 sixteen-pixel patterns
+- Source frames are held for as many hardware frames as needed, so a 30 fps source stays near 30 pictures per second. The scroll trick itself runs at the full 59.7 Hz LCD rate
+- No audio
+- Similar pictures can be held instead of stored again. `QUALITY=0` only merges near-duplicates. The default `4` allows a small amount of hold. Higher values make smaller ROMs and choppier motion
+- MBC5, up to 8 MB. A stream in which every frame is unique is about 43 KB/s at 30 fps, roughly three minutes in 8 MB
 
 ## Requirements
 
-For playing a GBVP2 video ROM on hardware, an MBC5-compatible flash cart is required. Remember that your cartridge's capacity must be big enough for your ROM – if your ROM is over 4MBs, you will need a cartridge that can store a 8MB ROM. (Note: the common EMS 64M flash carts can only store two 4MB (32 megabits) ROMs, not a single 8MB (64 megabits) ROM)
+Hardware needs an MBC5 flash cart. Cartridges that only accept a 4 MB image cannot hold a single 8 MB ROM.
 
-For playing a GBVP2 video ROM on an emulator, you must use an accurate Game Boy Color emulator, such as recent versions of [SameBoy](https://sameboy.github.io) or [BGB](http://bgb.bircd.org). GBVP2 will not work on inaccurate emulators, such as VisualBoyAdvance or GameBoy Online.
+On an emulator, use a cycle-accurate DMG core. [SameBoy](https://sameboy.github.io) and [BGB](http://bgb.bircd.org) are the ones this timing was aimed at. Each visible line wakes the CPU from the mode-2 STAT interrupt and writes the ten scroll values during that line's pixel fetch. An inaccurate emulator will shear it.
 
-For encoding and building a video ROM, you will need a Make, a C compiler (Clang recommended), [rgbds](https://github.com/rednex/rgbds/releases/), and a recent version of [FFMPEG](http://ffmpeg.org/).
+Building needs GNU Make, a C11 compiler, [RGBDS](https://rgbds.gbdev.io/) 1.0 or newer, and FFmpeg (`ffmpeg` and `ffprobe` on `PATH`).
 
-## Format Specifications
-
-* Irregular horizontal resolution, from effectively 120 pixels to 160 pixels wide, stretched to fill the 160 pixels wide Game Boy screen
-* Vertical resolution of 144 pixels, same as the Game Boy screen
-* Effectively up to 528 different colors per frame
-* Stereo PCM audio at 9198 Hz and 3-bits per channel
-* A frame rate of 29.86 frames per second
-* In-frame compression of successive similar rows of pixels, customizable compression quality
-* Can repeat a frame up to 255 times to avoid re-encoding highly similar frames
-
-## Building a ROM
-
-You can encode and build a ROM simply by running `make`:
+## Building
 
 ```
-make SOURCE=/path/to/my_video.mp4
+make SOURCE=/path/to/video.mp4
 ```
 
-`SOURCE` may be any file compatible with your copy of FFMPEG. Your output will be at `output/my_video/my_video.gbc`.
-
-Optionally, you may specify `QUALITY` to reduce the file size or, alternatively, improve video quality:
+The ROM is written to `output/video/video.gb` when the source file is named `video.mp4`.
 
 ```
-make SOURCE=/path/to/my_video.mp4 QUALITY=8
+make SOURCE=/path/to/video.mp4 QUALITY=8
 ```
 
-`QUALITY` can be any non-negative integer. The higher the value, the more aggressive the compression. A value of 0 performs no lossy compression after converting a frame to the player's format. The default value is 4.
+`QUALITY` is a non-negative integer. `0` stores a new picture whenever the frame changes. Higher values reuse the previous picture for longer.
+
+## Format
+
+Bank 0 is the player. Picture data starts at bank 1. A record is never split across a bank.
+
+A scroll picture never crosses a bank. The player starts one only below `$7600`:
+
+| Bytes | Meaning |
+| --- | --- |
+| 1 | How many hardware frames to show, from 1 to 254. `0` ends the stream. Playback returns to the first picture and waits for Start. `255` is not a repeat |
+| 1 | Flags. Bit 0 selects the other codebook before this picture |
+| 1 | How many hidden-codebook patches follow |
+| 5 each | Slot, then the left and right pixel bytes of that 16-pixel pattern |
+| 1440 | 144 lines of 10 scroll values |
+
+Tiles 0–127 hold two codebooks. Patches are written into the hidden one during vertical blank, so a later picture can use a different 256 patterns. A full-screen tile card can stand anywhere in the stream. It is 362 bytes and uses tiles from 128 upwards:
+
+| Bytes | Meaning |
+| --- | --- |
+| 1 | `255`, the tile-card mark |
+| 1 | How many hardware frames to show, from 1 to 255 |
+| 360 | 18 rows of 20 tile ids, drawn on the map at `$9C00` |
+
+A scroll value of `pattern - line` selects one of the 256 baked 16-pixel patterns for that cell. The pattern index is four 2-bit shades, leftmost pixel in the top bits. Shade 0 is the lightest grey.
+
+## Timing
+
+`TUNE_NOPS` in `video.asm` places the scroll writes on the pixel fetch. Each nop slips them four dots later. If a build looks shifted or sliced on hardware, that constant is the adjustment.
+
+## Licence
+
+MIT, the same terms as GBVideoPlayer2. Copyright for the original player and encoder remains with Lior Halphon. See `LICENSE`.

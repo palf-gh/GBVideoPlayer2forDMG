@@ -1,5 +1,25 @@
-# Quality: Lower is better. 0 is lossless as far as the format allows.
+# Quality: 0 repeats a frame only when it is almost identical to the last
+# stored picture. Higher values hold the previous picture for longer.
+# PIXEL=1 scales with nearest neighbour and maps four-colour pixel art
+# onto the shade clusters, without the photo dither.
+# CARDS is a directory of 160x144 text screens. Each matching source
+# frame, wherever it sits, is stored as tiles instead of scroll patterns.
 QUALITY ?= 4
+PIXEL ?= 0
+CARDS ?= glyphs/cards
+
+RGBASM ?= rgbasm
+RGBLINK ?= rgblink
+RGBFIX ?= rgbfix
+CC ?= gcc
+
+ifeq ($(OS),Windows_NT)
+  EXE := .exe
+  PATHCONV := cygpath -w -f -
+else
+  EXE :=
+  PATHCONV := cat
+endif
 
 ifneq ($(MAKECMDGOALS),clean)
 ifeq ($(SOURCE),)
@@ -9,51 +29,72 @@ endif
 
 OUT := output/$(basename $(notdir $(SOURCE)))
 $(shell mkdir -p $(OUT))
-CC ?= clang
 FFMPEG := ffmpeg -loglevel warning -stats -hide_banner
+ENCODER := output/encoder$(EXE)
 
 TITLE = "\033[1m\033[36m"
 TITLE_END = "\033[0m"
 
-$(OUT)/$(basename $(notdir $(SOURCE))).gbc: output/video.gbc $(OUT)/video.bin
+.PHONY: clean
+
+$(OUT)/$(basename $(notdir $(SOURCE))).gb: output/player.gb $(OUT)/video.bin
 	@echo $(TITLE)Creating ROM...$(TITLE_END)
 	cat $^ > $@
-	rgbfix -Cv -t "GBVP2" -m 25 $@
+	$(RGBFIX) -v -p 0xff -t "GBVPDMG" -m 25 $@
 	cp output/video.sym $(basename $@).sym
-	
-output/video.gbc: video.asm
+
+output/player.gb: video.asm gbhw.asm
 	@echo $(TITLE)Compiling player...$(TITLE_END)
-	rgbasm -o $@.o $<
-	rgblink -o $@ -m output/video.map -n output/video.sym $@.o
+	$(RGBASM) $(RGBASM_FLAGS) -o output/player.o video.asm
+	$(RGBLINK) -o $@ -n output/video.sym -m output/video.map output/player.o
+	@test $$(wc -c < $@) -eq 16384
 
-$(OUT)/video.bin: output/encoder $(OUT)/frames $(OUT)/audio.raw
+ifeq ($(PIXEL),1)
+  ENCODER_MODE := pixel
+  SCALE_FILTER := scale=160:144:flags=neighbor
+  RGBASM_FLAGS := -D CUSTOM_PATTERNS
+else
+  ENCODER_MODE := $(QUALITY)
+  SCALE_FILTER := scale=160:144:force_original_aspect_ratio=increase,crop=160:144
+  RGBASM_FLAGS :=
+endif
+
+ifeq ($(PIXEL),1)
+output/player.gb: output/patterns.inc output/bookb.inc output/font.inc
+
+output/patterns.inc output/bookb.inc: pixel_encode.py output/cards.bin $(OUT)/frames
 	@echo $(TITLE)Encoding video...$(TITLE_END)
-	find $(OUT)/frames | sort | \
-	output/encoder $(shell ffmpeg -i $(SOURCE) 2>&1 | sed -n "s/.*, \(.*\) fp.*/\1/p") \
-	               $(QUALITY) \
-	               $(OUT)/audio.raw \
-	               $@ \
+	python pixel_encode.py $(OUT)/frames output/cards.bin output/patterns.inc output/bookb.inc $(OUT)/video.bin \
+		$(shell ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nw=1:nk=1 "$(SOURCE)")
 
-output/encoder: encoder.c
+$(OUT)/video.bin: output/patterns.inc
+	@test -s $@
+
+output/font.inc output/cards.bin: cards.py $(wildcard $(CARDS)/*.png) $(wildcard $(CARDS)/*.tga)
+	@echo $(TITLE)Building credit font...$(TITLE_END)
+	python cards.py $(CARDS) output/font.inc output/cards.bin
+endif
+
+ifneq ($(PIXEL),1)
+$(OUT)/video.bin: $(ENCODER) $(OUT)/frames
+	@echo $(TITLE)Encoding video...$(TITLE_END)
+	find $(OUT)/frames -name '*.tga' | sort | $(PATHCONV) | \
+	$(ENCODER) $(shell ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nw=1:nk=1 "$(SOURCE)") \
+	           $(ENCODER_MODE) \
+	           $@
+endif
+
+$(ENCODER): encoder.c
 	@echo $(TITLE)Compiling encoder...$(TITLE_END)
-	$(CC) -g -Ofast -std=c11 -Werror -Wall -o $@ $^
+	$(CC) -g -O2 -std=c11 -Werror -Wall -o $@ $^
 
-$(OUT)/audio.raw: $(SOURCE)
-	@echo $(TITLE)Converting audio...$(TITLE_END)
-	$(eval GAIN := 0$(shell ffmpeg -i $^ -filter:a volumedetect -f null /dev/null 2>&1 | sed -n "s/.*max_volume: -\(.*\) dB/\1/p"))
-	$(FFMPEG) -i $^ -f u8 -acodec pcm_u8 -ar 9198 -filter:a "volume=$(GAIN)dB" $@ 
-
-$(OUT)/frames: $(OUT)/video.mp4
+$(OUT)/frames: $(SOURCE)
 	@echo $(TITLE)Extracting frames...$(TITLE_END)
-	-@rm -rf $@
+	rm -rf $@
 	mkdir -p $@
-	$(FFMPEG) -i $^ -coder "raw" $@/%05d.tga
+	$(FFMPEG) -i "$(SOURCE)" -an \
+	  -vf "$(SCALE_FILTER)" \
+	  $@/%05d.tga
 
-$(OUT)/video.mp4: $(SOURCE)
-	@echo $(TITLE)Resizing video...$(TITLE_END)
-	$(FFMPEG) -i $^ -c:v rawvideo  -vf scale=-2:144 $@.tmp.mp4
-	$(FFMPEG) -i $@.tmp.mp4 -c:v rawvideo  -filter:v "crop=160:144" $@
-	rm $@.tmp.mp4
-	
 clean:
 	rm -rf output

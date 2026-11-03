@@ -1,1 +1,20 @@
-output
+# Encoded video, ROMs, and intermediate build products
+output/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Object files and RGBDS products left outside output/
+*.o
+*.obj
+*.exe
+*.sym
+*.map
+
+# Editor and operating-system clutter
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

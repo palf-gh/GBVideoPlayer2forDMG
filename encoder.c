@@ -1,514 +1,446 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-#include <stdint.h>
-
-#define SCREEN_SIZE (160 * 144)
-#define PIXELS (SCREEN_SIZE * 2)
-#define SCY_DATA_SIZE (PIXELS / 8)
-#define PALETTE_SIZE (8 * 4)
-#define DIFF_THRESHOLD 0x8000 // Todo: make this an argument?
-
-unsigned compressed_size = 0;
-unsigned uncompressed_size = 0;
-static const double GB_FPS = (1024 * 1024 * 4) / (70224.0);
-
-typedef struct {
-    uint8_t b, g, r;
-} color_t;
-#define COLOR_INDEX(PAL, IND) ((PAL) * 4 + (IND))
-
-#define LEFT_COMBINATIONS(LEFT, FIRST_RIGHT) \
-LEFT, LEFT, LEFT, FIRST_RIGHT + 0, FIRST_RIGHT + 0 , FIRST_RIGHT + 0 , FIRST_RIGHT + 0 , FIRST_RIGHT + 0 , \
-LEFT, LEFT, LEFT, FIRST_RIGHT + 1, FIRST_RIGHT + 1 , FIRST_RIGHT + 1 , FIRST_RIGHT + 1 , FIRST_RIGHT + 1 , \
-LEFT, LEFT, LEFT, FIRST_RIGHT + 2, FIRST_RIGHT + 2 , FIRST_RIGHT + 2 , FIRST_RIGHT + 2 , FIRST_RIGHT + 2 , \
-LEFT, LEFT, LEFT, FIRST_RIGHT + 3, FIRST_RIGHT + 3 , FIRST_RIGHT + 3 , FIRST_RIGHT + 3 , FIRST_RIGHT + 3 , \
-
-#define LEFT_COMBINATIONS_FOR_PALETTE(PAL) \
-LEFT_COMBINATIONS(COLOR_INDEX(PAL, 0), COLOR_INDEX(PAL, 0)) \
-LEFT_COMBINATIONS(COLOR_INDEX(PAL, 1), COLOR_INDEX(PAL, 0)) \
-LEFT_COMBINATIONS(COLOR_INDEX(PAL, 2), COLOR_INDEX(PAL, 0)) \
-LEFT_COMBINATIONS(COLOR_INDEX(PAL, 3), COLOR_INDEX(PAL, 0)) \
-
-#define RIGHT_COMBINATION(LEFT, RIGHT) \
-LEFT, LEFT, \
-(LEFT) == (RIGHT) ? (LEFT) ^ 1 : LEFT, (LEFT) == (RIGHT) ? (LEFT) ^ 1 : LEFT, \
-(LEFT) == (RIGHT) ? (LEFT) ^ 2 : LEFT, (LEFT) == (RIGHT) ? (LEFT) ^ 2 : RIGHT, \
-(LEFT) == (RIGHT) ? (LEFT) ^ 3 : RIGHT , (LEFT) == (RIGHT) ? (LEFT) ^ 3 : RIGHT, \
-
-#define RIGHT_COMBINATIONS(LEFT, FIRST_RIGHT) \
-RIGHT_COMBINATION(LEFT, FIRST_RIGHT + 0) \
-RIGHT_COMBINATION(LEFT, FIRST_RIGHT + 1) \
-RIGHT_COMBINATION(LEFT, FIRST_RIGHT + 2) \
-RIGHT_COMBINATION(LEFT, FIRST_RIGHT + 3) \
-
-#define RIGHT_COMBINATIONS_FOR_PALETTE(PAL) \
-RIGHT_COMBINATIONS(COLOR_INDEX(PAL, 0), COLOR_INDEX(PAL, 0)) \
-RIGHT_COMBINATIONS(COLOR_INDEX(PAL, 1), COLOR_INDEX(PAL, 0)) \
-RIGHT_COMBINATIONS(COLOR_INDEX(PAL, 2), COLOR_INDEX(PAL, 0)) \
-RIGHT_COMBINATIONS(COLOR_INDEX(PAL, 3), COLOR_INDEX(PAL, 0)) \
- 
-/*
- 
- // Alternative encoding, can't be configured right now
- 
-#define LEFT_COMBINATIONS(LEFT, FIRST_RIGHT) \
-LEFT, LEFT, FIRST_RIGHT + 0, FIRST_RIGHT + 0 , LEFT, LEFT, FIRST_RIGHT + 0 , FIRST_RIGHT + 0 , \
-LEFT, LEFT, FIRST_RIGHT + 1, FIRST_RIGHT + 1 , LEFT, LEFT, FIRST_RIGHT + 1 , FIRST_RIGHT + 1 , \
-LEFT, LEFT, FIRST_RIGHT + 2, FIRST_RIGHT + 2 , LEFT, LEFT, FIRST_RIGHT + 2 , FIRST_RIGHT + 2 , \
-LEFT, LEFT, FIRST_RIGHT + 3, FIRST_RIGHT + 3 , LEFT, LEFT, FIRST_RIGHT + 3 , FIRST_RIGHT + 3 , \
-
-#define LEFT_COMBINATIONS_FOR_PALETTE(PAL) \
-LEFT_COMBINATIONS(COLOR_INDEX(PAL, 0), COLOR_INDEX(PAL, 0)) \
-LEFT_COMBINATIONS(COLOR_INDEX(PAL, 1), COLOR_INDEX(PAL, 0)) \
-LEFT_COMBINATIONS(COLOR_INDEX(PAL, 2), COLOR_INDEX(PAL, 0)) \
-LEFT_COMBINATIONS(COLOR_INDEX(PAL, 3), COLOR_INDEX(PAL, 0)) \
-
-#define RIGHT_COMBINATIONS(LEFT, FIRST_RIGHT) \
-LEFT, LEFT, FIRST_RIGHT + 0, FIRST_RIGHT + 0 , LEFT ^ 3, LEFT ^ 3, (FIRST_RIGHT + 0) ^ 3 , (FIRST_RIGHT + 0) ^ 3 , \
-LEFT, LEFT, FIRST_RIGHT + 1, FIRST_RIGHT + 1 , LEFT ^ 3, LEFT ^ 3, (FIRST_RIGHT + 1) ^ 3 , (FIRST_RIGHT + 1) ^ 3 , \
-LEFT, LEFT, FIRST_RIGHT + 2, FIRST_RIGHT + 2 , LEFT ^ 3, LEFT ^ 3, (FIRST_RIGHT + 2) ^ 3 , (FIRST_RIGHT + 2) ^ 3 , \
-LEFT, LEFT, FIRST_RIGHT + 3, FIRST_RIGHT + 3 , LEFT ^ 3, LEFT ^ 3, (FIRST_RIGHT + 3) ^ 3 , (FIRST_RIGHT + 3) ^ 3 , \
-
-#define RIGHT_COMBINATIONS_FOR_PALETTE(PAL) \
-RIGHT_COMBINATIONS(COLOR_INDEX(PAL, 0), COLOR_INDEX(PAL, 0)) \
-RIGHT_COMBINATIONS(COLOR_INDEX(PAL, 1), COLOR_INDEX(PAL, 0)) \
-RIGHT_COMBINATIONS(COLOR_INDEX(PAL, 2), COLOR_INDEX(PAL, 0)) \
-RIGHT_COMBINATIONS(COLOR_INDEX(PAL, 3), COLOR_INDEX(PAL, 0)) \
+/* DMG bitstream encoder for GBVideoPlayer2forDMG.
+ * Derived from LIJI32's GBVideoPlayer2 encoder.
+ *
+ * A scroll picture never crosses a ROM bank. The player starts a record
+ * only while HL is below $7600, leaving 2560 bytes. Layout:
+ *   u8  repeat          1-254. 0 ends the stream and the player waits
+ *                       for Start. 255 introduces a tile card instead.
+ *   u8  flags           bit 0 flips which codebook is on screen
+ *   u8  updates         how many hidden-book patches follow
+ *   updates * 5 u8      slot, left low, left high, right low, right high
+ *   144 * 10 u8         SCY values, one per 16-pixel cell
+ * A tile card is its own picture and may sit anywhere in the stream:
+ *   u8  255
+ *   u8  repeat          1-255
+ *   18 * 20 u8          background tile ids, row by row
+ * Each SCY byte is (pattern - y) mod 256. The pattern index holds four
+ * 4-pixel shades, MSB on the left. Shade 0 is light and shade 3 is dark.
  */
 
-const static uint8_t combinations[256 * 8] =
-{
-    LEFT_COMBINATIONS_FOR_PALETTE(7)
-    RIGHT_COMBINATIONS_FOR_PALETTE(7)
-    LEFT_COMBINATIONS_FOR_PALETTE(6)
-    RIGHT_COMBINATIONS_FOR_PALETTE(6)
-    LEFT_COMBINATIONS_FOR_PALETTE(5)
-    RIGHT_COMBINATIONS_FOR_PALETTE(5)
-    LEFT_COMBINATIONS_FOR_PALETTE(4)
-    RIGHT_COMBINATIONS_FOR_PALETTE(4)
-    LEFT_COMBINATIONS_FOR_PALETTE(3)
-    RIGHT_COMBINATIONS_FOR_PALETTE(3)
-    LEFT_COMBINATIONS_FOR_PALETTE(2)
-    RIGHT_COMBINATIONS_FOR_PALETTE(2)
-    LEFT_COMBINATIONS_FOR_PALETTE(1)
-    RIGHT_COMBINATIONS_FOR_PALETTE(1)
-    LEFT_COMBINATIONS_FOR_PALETTE(0)
-    RIGHT_COMBINATIONS_FOR_PALETTE(0)
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+#define SCREEN_W 160
+#define SCREEN_H 144
+#define SCREEN_SIZE (SCREEN_W * SCREEN_H)
+#define CELLS 10
+#define FRAME_BYTES (3 + SCREEN_H * CELLS)
+#define TILE_MARK 255
+#define CARD_W 20
+#define CARD_H 18
+#define CARD_MAP (CARD_W * CARD_H)
+
+_Static_assert(FRAME_BYTES == 1443, "scroll header is repeat, flags, count");
+
+static const double GB_FPS = (1024.0 * 1024.0 * 4.0) / 70224.0;
+
+static uint8_t output[1024 * 1024 * 8 + 0x4000];
+static size_t pos = 0x4000;
+static size_t frame_count_pos = 0;
+
+static const int bayer[4][4] = {
+    {0, 8, 2, 10},
+    {12, 4, 14, 6},
+    {3, 11, 1, 9},
+    {15, 7, 13, 5},
 };
 
-/* RGB2 is rounded to 5bpc, RGB1 remains as is. */
-static unsigned rounded_color_diff(signed r1, signed g1, signed b1, signed r2, signed g2, signed b2)
+static int quantise(int luma)
 {
-    r2 &= 0xF8;
-    r2 |= r2 >> 5;
-    
-    g2 &= 0xF8;
-    g2 |= g2 >> 5;
-    
-    b2 &= 0xF8;
-    b2 |= b2 >> 5;
-    
-    return abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2);
+    if (luma >= 213) return 0;
+    if (luma >= 128) return 1;
+    if (luma >= 43) return 2;
+    return 3;
 }
 
-static unsigned score_for_combination(const uint8_t *r, const uint8_t *g, const uint8_t *b, const color_t *palette, uint8_t combination)
+/* Four-colour pixel art sits in clusters near luma 45, 129, 200 and 246.
+ * The photo thresholds put the darkest cluster in shade 2, and the ordered
+ * dither then flips the others. These cuts sit in the gaps between clusters. */
+static int quantise_art(int luma)
 {
-    unsigned score = 0;
-    for (unsigned x = 0; x < 8; x++) {
-        unsigned color_index = combinations[combination * 8 + x];
-        unsigned diff = rounded_color_diff(r[x], g[x], b[x],
-                                           palette[color_index].r, palette[color_index].g, palette[color_index].b);
-        score += diff;
-    }
-    
-    return score;
+    if (luma >= 220) return 0;
+    if (luma >= 160) return 1;
+    if (luma >= 80) return 2;
+    return 3;
 }
 
-static unsigned best_combination_for_pixels(const uint8_t *r, const uint8_t *g, const uint8_t *b, const color_t *palette, unsigned *score)
+static int pixel_art = 0;
+static int card_count = 0;
+static int last_card = -1;
+static uint8_t *card_shades = NULL;
+static uint8_t *card_maps = NULL;
+static uint8_t last_index[SCREEN_H * CELLS];
+static uint8_t codebook[256][16];
+static unsigned long exact_cells = 0;
+static unsigned long total_cells = 0;
+static unsigned tile_pictures = 0;
+
+static int cell_code(const uint8_t *shades)
 {
-    unsigned best = -1;
-    unsigned best_index = -1;
-    for (unsigned combination = 0; combination < 256; combination++) {
-        unsigned current_score = score_for_combination(r, g, b, palette, combination);
-        if (current_score < best) {
-            best = current_score;
-            best_index = combination;
+    int best_index = 0;
+    int best_dist = 1 << 30;
+
+    for (int i = 0; i < 256; i++) {
+        int dist = 0;
+        const uint8_t *pattern = codebook[i];
+        for (int pixel = 0; pixel < 16; pixel++) {
+            int delta = (int)shades[pixel] - (int)pattern[pixel];
+            dist += delta < 0 ? -delta : delta;
+        }
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_index = i;
+            if (dist == 0) break;
         }
     }
-    
-    if (score) *score = best;
-    
     return best_index;
 }
 
-static bool optimize_palette_step(const uint8_t *r, const uint8_t *g, const uint8_t *b, color_t *palette, unsigned old_score, unsigned *new_score)
+static int clamp_byte(int value)
 {
-    unsigned r_sum[PALETTE_SIZE] = {0,};
-    unsigned g_sum[PALETTE_SIZE] = {0,};
-    unsigned b_sum[PALETTE_SIZE] = {0,};
-    unsigned count[PALETTE_SIZE] = {0,};
-    unsigned combination_score = 0;
-    unsigned score = 0;
-    color_t old_palette[PALETTE_SIZE];
-    memcpy(&old_palette, palette, sizeof(old_palette));
-    setbuf(stdout, NULL);
-    for (unsigned i = SCY_DATA_SIZE; i--;) {
-        const uint8_t *combination = combinations + (best_combination_for_pixels(r, g, b, palette, &combination_score)) * 8;
-        score += combination_score;
-        for (unsigned x = 8; x--;) {
-            unsigned color_index = *(combination++);
-            r_sum[color_index] += *(r++);
-            g_sum[color_index] += *(g++);
-            b_sum[color_index] += *(b++);
-            count[color_index] ++;
-        }
-    }
-    
-    
-    for (unsigned i = 0; i < PALETTE_SIZE; i++) {
-        if (count[i]) {
-            palette[i].r = r_sum[i] / count[i];
-            palette[i].g = g_sum[i] / count[i];
-            palette[i].b = b_sum[i] / count[i];
-        }
-        else {
-            palette[i].r = rand();
-            palette[i].g = rand();
-            palette[i].b = rand();
-        }
-    }
-    
-    if (old_score <= score) {
-        memcpy(palette, &old_palette, sizeof(old_palette));
-        return false;
-    }
-    *new_score = score;
-    return true;
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return value;
 }
 
-__attribute__((unused)) static void dump_tga_paletted(const char *output, const uint8_t *r, const uint8_t *g, const uint8_t *b, color_t *palette)
+static void align_frame(void)
 {
-    static const uint8_t header[] = {
-        0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0xA0, 0x00, 0x90, 0x00, 0x18, 0x20,
-    };
-    FILE *out = fopen(output, "wb");
-    fwrite(header, sizeof(header), 1, out);
-    for (unsigned i = SCY_DATA_SIZE; i--;) {
-        const uint8_t *combination = combinations + (best_combination_for_pixels(r, g, b, palette, NULL)) * 8;
-        
-        for (unsigned x = 8; x--;) {
-            fwrite(palette + *(combination++), 3, 1, out);
-        }
-        r += 8;
-        g += 8;
-        b += 8;
+    /* Player switches when the high byte reaches $76, i.e. offset $3600. */
+    size_t off = pos & 0x3fff;
+    if (off >= 0x3600) {
+        pos = (pos + 0x3fff) & ~(size_t)0x3fff;
     }
-    fclose(out);
-}
-
-void round_palette(color_t *palette)
-{
-    for (unsigned i = PALETTE_SIZE; i--;) {
-        palette->r &= 0xF8;
-        palette->r |= palette->r >> 5;
-        
-        palette->g &= 0xF8;
-        palette->g |= palette->g >> 5;
-        
-        palette->b &= 0xF8;
-        palette->b |= palette->b >> 5;
-        
-        palette++;
+    if (pos / 0x4000 >= 0x200) {
+        fprintf(stderr, "error: video exceeds 512 ROM banks\n");
+        exit(1);
     }
 }
 
-static uint8_t output[1024 * 1024 * 8 + 0x4000];
-size_t pos = 0x4001;
-size_t frame_count_pos = 0;
-/* Quality: 0 is lossless (as far as format allows), increasing value reduces quality */
-static void encode_image(const uint8_t *r, const uint8_t *g, const uint8_t *b, const color_t *palette, unsigned quality, unsigned count)
+static void encode_image(const uint8_t *luma, unsigned repeat)
 {
-    if (count > 255) {
-        encode_image(r, g, b, palette, quality, count - 255);
-        count = 255;
+    uint8_t frame[FRAME_BYTES];
+    size_t n = 0;
+
+    /* 255 is the tile-card mark, so a scroll repeat stops at 254. */
+    if (repeat > 254) {
+        encode_image(luma, 254);
+        repeat -= 254;
     }
-    static uint8_t previous_line_buffer[20] = {0,};
-    uint8_t line_buffer[20] = {};
-    uint8_t lossy_line_buffer[20] = {};
-    quality += 8;
-    
-    /* Frames are not allowed to start in bank 0xFF */
-    if (pos / 0x4000 == 0xFF) {
-        pos &= ~0x3fff;
-        pos += 0x4000;
-        printf("\n\033[1m\033[33mWarning: This video exceeds 256 banks, it might not be compatible with all flash carts\033[0m\n");
+
+    frame[n++] = (uint8_t)repeat;
+    frame[n++] = 0;
+    frame[n++] = 0;
+    for (int y = 0; y < SCREEN_H; y++) {
+        const uint8_t *row = luma + (size_t)y * SCREEN_W;
+        for (int cell = 0; cell < CELLS; cell++) {
+            int index;
+            if (pixel_art) {
+                uint8_t shades[16];
+                const uint8_t *px = row + cell * 16;
+                for (int pixel = 0; pixel < 16; pixel++) {
+                    shades[pixel] = (uint8_t)quantise_art(px[pixel]);
+                }
+                index = cell_code(shades);
+            } else {
+                int shade[4];
+                for (int sub = 0; sub < 4; sub++) {
+                    const uint8_t *px = row + (cell * 16) + sub * 4;
+                    int average = (px[0] + px[1] + px[2] + px[3]) / 4;
+                    int jitter = (bayer[y & 3][sub] - 8) * 4;
+                    shade[sub] = quantise(clamp_byte(average + jitter));
+                }
+                index = (shade[0] << 6) | (shade[1] << 4) | (shade[2] << 2) | shade[3];
+            }
+            frame[n++] = (uint8_t)(index - y);
+        }
     }
-    
+    if (n != FRAME_BYTES) {
+        fprintf(stderr, "error: internal frame size %u\n", (unsigned)n);
+        exit(1);
+    }
+
+    align_frame();
     frame_count_pos = pos;
-    output[pos++] = (uint8_t) count;
-    
-    if ((pos & 0x3fff) >= 0x4000 - 33) {
-        output[pos] = 0xFF; // Needs bank switch
-        pos &= ~0x3fff;
-        pos += 0x4000;
-    }
-    for (unsigned i = 0; i < PALETTE_SIZE / 2; i++) {
-        uint16_t color = (palette[i].r >> 3) | ((palette[i].g >> 3) << 5) | ((palette[i].b >> 3) << 10);
-        output[pos++] = color >> 8;
-        output[pos++] = color;
-    }
-    
-    if ((pos & 0x3fff) >= 0x4000 - 33) {
-        output[pos] = 0xFF; // Needs bank switch
-        pos &= ~0x3fff;
-        pos += 0x4000;
-    }
-    for (unsigned i = PALETTE_SIZE / 2; i < PALETTE_SIZE; i++) {
-        uint16_t color = (palette[i].r >> 3) | ((palette[i].g >> 3) << 5) | ((palette[i].b >> 3) << 10);
-        output[pos++] = color >> 8;
-        output[pos++] = color;
-    }
-    
-    for (unsigned y = 0; y < 288; y++) {
-        unsigned ndiffs = 0;
-        for (unsigned j = 0; j < 20; j++) {
-            unsigned score;
-            uint8_t combination = (best_combination_for_pixels(r, g, b, palette, &score));
-            line_buffer[j] = combination;
-            lossy_line_buffer[j] = combination;
-            if (previous_line_buffer[j] != combination) {
-                unsigned lossy_score = score_for_combination(r, g, b, palette, previous_line_buffer[j]);
-                if (lossy_score > score * quality / 8) {
-                    ndiffs++;
-                }
-                else {
-                    lossy_line_buffer[j] = previous_line_buffer[j];
-                }
-            }
-
-            r += 8;
-            g += 8;
-            b += 8;
-        }
-        
-        if (y == 0) {
-            /* Using compression for the first line in the first subframe has some unpleast artifacts if the palette
-               greatly changed from the previous frame */
-            ndiffs = 20;
-        }
-        
-        static const unsigned max_diffs = 3;
-        
-        if ((pos & 0x3fff) < 0x4000 - 22) {
-            /* Sadly, we only support up to 3 diffs, because 4 diffs and more take too much CPU cycles to copy */
-            if (ndiffs > max_diffs) {
-                output[pos++] = 0; // Uncompressed, no bank switch
-            }
-            else {
-                output[pos++] = (((9 - ndiffs) * 3 + 1) << 1); // Compressed
-            }
-        }
-        else {
-            output[pos] = 1; // Uncompressed, Bank switch
-            pos &= ~0x3fff;
-            pos += 0x4000;
-            ndiffs = 20;
-        }
-        
-        if (ndiffs > max_diffs) {
-            memcpy(previous_line_buffer, line_buffer, 20);
-            memcpy(output + pos, line_buffer, 20);
-            for (unsigned i = 20; i--;) {
-                output[pos++] -= (y % 144);
-            }
-        }
-        else {
-            unsigned test = 0;
-            for (unsigned i = 0; i < 20; i++) {
-                if (previous_line_buffer[i] != lossy_line_buffer[i]) {
-                    output[pos++] = lossy_line_buffer[i] - (y % 144) + 1;
-                    output[pos++] = i + 0xc1;
-                    test++;
-                }
-            }
-            memcpy(previous_line_buffer, lossy_line_buffer, 20);
-            if (test != ndiffs) {
-                printf("WAT %d != %d\n", test, ndiffs);
-                exit(1);
-            }
-        }
-    }
-    
-    if (count != 1 && pos / 0x4000 == 0xFF) {
-        /* The last frame in the first 256 banks must not repeat. Encode the frame once again in the next bank. */
-        
-        output[frame_count_pos] = 1;
-        encode_image(r - 46080, g - 46080, b - 46080, palette, quality, count - 1);
-    }
+    memcpy(output + pos, frame, FRAME_BYTES);
+    pos += FRAME_BYTES;
 }
 
-static uint8_t quantize(signed sample)
+static void encode_tile(const uint8_t *map, unsigned repeat)
 {
-    if (sample < 18)  return 0;
-    if (sample < 55)  return 1;
-    if (sample < 91)  return 2;
-    if (sample < 130) return 3;
-    if (sample < 164) return 4;
-    if (sample < 200) return 5;
-    if (sample < 237) return 6;
-    return 7;
+    if (repeat > 255) {
+        encode_tile(map, 255);
+        repeat -= 255;
+    }
+    align_frame();
+    output[pos] = TILE_MARK;
+    frame_count_pos = pos + 1;
+    output[pos + 1] = (uint8_t)repeat;
+    memcpy(output + pos + 2, map, CARD_MAP);
+    pos += 2 + CARD_MAP;
 }
 
-int main(int argc, const char * argv[])
+static int match_card(const uint8_t *luma)
 {
-    
-    if (argc != 5) {
-        printf("Usage: %s frame_rate quality audio_file.pcm output.bin < frame_list.txt\n", argv[0]);
-        return -1;
+    for (int card = 0; card < card_count; card++) {
+        const uint8_t *ref = card_shades + (size_t)card * SCREEN_SIZE;
+        int same = 1;
+        for (int i = 0; i < SCREEN_SIZE; i++) {
+            if (quantise_art(luma[i]) != ref[i]) {
+                same = 0;
+                break;
+            }
+        }
+        if (same) return card;
     }
-    
-    double source_fps = atof(argv[1]);
-    unsigned quality = atoi(argv[2]);
-    
-    uint8_t r[PIXELS], g[PIXELS], b[PIXELS], rgb[SCREEN_SIZE * 3];
-    color_t palette[PALETTE_SIZE] = {{0,},};
-    color_t rounded_palette[PALETTE_SIZE] = {{0,},};
-    bool palette_inited = false;
-    unsigned id = 0;
-    double frame_multiplier = GB_FPS / 2 / source_fps;
-    double fps_tracking = 0;
- 
-    FILE *audiof = fopen(argv[3], "rb");
-    if (!audiof) {
-        perror("Failed to load PCM file");
+    return -1;
+}
+
+static void load_cards(void)
+{
+    FILE *in = fopen("output/cards.bin", "rb");
+    if (!in) return;
+    uint16_t count = 0;
+    if (fread(&count, 2, 1, in) != 1) {
+        fprintf(stderr, "error: short output/cards.bin\n");
+        exit(1);
+    }
+    card_count = count;
+    if (!card_count) {
+        fclose(in);
+        return;
+    }
+    card_shades = malloc((size_t)card_count * SCREEN_SIZE);
+    card_maps = malloc((size_t)card_count * CARD_MAP);
+    if (!card_shades || !card_maps) {
+        fprintf(stderr, "error: out of memory for credit cards\n");
+        exit(1);
+    }
+    for (int card = 0; card < card_count; card++) {
+        if (fread(card_shades + (size_t)card * SCREEN_SIZE, 1, SCREEN_SIZE, in) != SCREEN_SIZE ||
+            fread(card_maps + (size_t)card * CARD_MAP, 1, CARD_MAP, in) != CARD_MAP) {
+            fprintf(stderr, "error: truncated output/cards.bin\n");
+            exit(1);
+        }
+    }
+    fclose(in);
+}
+
+static int read_tga(FILE *in, uint8_t *luma)
+{
+    uint8_t header[18];
+    uint8_t bgr[SCREEN_SIZE * 3];
+
+    if (fread(header, 1, sizeof header, in) != sizeof header) {
+        fprintf(stderr, "error: short TGA header\n");
+        return 0;
+    }
+    if ((header[2] != 2 && header[2] != 10) || header[16] != 24) {
+        fprintf(stderr, "error: expected a 24-bit true-colour TGA\n");
+        return 0;
+    }
+    unsigned width = (unsigned)header[12] | ((unsigned)header[13] << 8);
+    unsigned height = (unsigned)header[14] | ((unsigned)header[15] << 8);
+    if (width != SCREEN_W || height != SCREEN_H) {
+        fprintf(stderr, "error: TGA is %ux%u, expected 160x144\n", width, height);
+        return 0;
+    }
+    if (header[0] && fseek(in, header[0], SEEK_CUR) != 0) {
+        fprintf(stderr, "error: TGA id skip failed\n");
+        return 0;
+    }
+    if (header[2] == 2) {
+        if (fread(bgr, 1, sizeof bgr, in) != sizeof bgr) {
+            fprintf(stderr, "error: short TGA image\n");
+            return 0;
+        }
+    } else {
+        size_t filled = 0;
+        while (filled < SCREEN_SIZE) {
+            int packet = fgetc(in);
+            if (packet == EOF) {
+                fprintf(stderr, "error: truncated TGA RLE stream\n");
+                return 0;
+            }
+            size_t count = (size_t)(packet & 0x7f) + 1;
+            if (filled + count > SCREEN_SIZE) {
+                fprintf(stderr, "error: TGA RLE overrun\n");
+                return 0;
+            }
+            if (packet & 0x80) {
+                uint8_t pixel[3];
+                if (fread(pixel, 1, 3, in) != 3) {
+                    fprintf(stderr, "error: truncated TGA RLE pixel\n");
+                    return 0;
+                }
+                for (size_t i = 0; i < count; i++) {
+                    memcpy(bgr + (filled + i) * 3, pixel, 3);
+                }
+            } else if (fread(bgr + filled * 3, 1, count * 3, in) != count * 3) {
+                fprintf(stderr, "error: truncated TGA raw packet\n");
+                return 0;
+            }
+            filled += count;
+        }
+    }
+
+    int top_origin = (header[17] & 0x20) != 0;
+    for (int y = 0; y < SCREEN_H; y++) {
+        int src_y = top_origin ? y : (SCREEN_H - 1 - y);
+        const uint8_t *src = bgr + (size_t)src_y * SCREEN_W * 3;
+        uint8_t *dst = luma + (size_t)y * SCREEN_W;
+        for (int x = 0; x < SCREEN_W; x++) {
+            int b = src[x * 3];
+            int g = src[x * 3 + 1];
+            int r = src[x * 3 + 2];
+            dst[x] = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
+        }
+    }
+    return 1;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 4) {
+        fprintf(stderr, "usage: %s frame_rate quality output.bin < frame_list.txt\n", argv[0]);
         return 1;
     }
-    
-    memset(output, 0xFF, sizeof(output));
-    
-    bool done = false;
-    while (!done) {
-        for (unsigned i = 154; i--; ) {
-            uint8_t left, right;
-            if (fread(&left, 1, 1, audiof) != 1 || fread(&right, 1, 1, audiof) != 1) {
-                left = right = 0x80;
-                done = true;
-            }
-            
-            output[pos++] = quantize(left) | (quantize(right) << 4);
-        }
-        if ((pos & 0x3FFF) + 154 > 0x4000) {
-            pos &= ~0x3fff;
-            pos += 0x4000;
-        }
+
+    double source_fps = strtod(argv[1], NULL);
+    const char *slash = strchr(argv[1], '/');
+    if (slash) {
+        double denominator = strtod(slash + 1, NULL);
+        if (denominator != 0.0) source_fps /= denominator;
     }
-    
-    pos--;
-    pos &= ~0x3fff;
-    pos += 0x4000;
-    output[0x4000] = pos / 0x4000;
-    fclose(audiof);
+    unsigned quality = 0;
+    if (strcmp(argv[2], "pixel") == 0) {
+        pixel_art = 1;
+        FILE *codebook_file = fopen("output/codebook.bin", "rb");
+        if (!codebook_file || fread(codebook, 16, 256, codebook_file) != 256) {
+            fprintf(stderr, "error: could not read output/codebook.bin\n");
+            if (codebook_file) fclose(codebook_file);
+            return 1;
+        }
+        fclose(codebook_file);
+        load_cards();
+    } else {
+        quality = (unsigned)atoi(argv[2]);
+    }
+    if (source_fps <= 0.0) {
+        fprintf(stderr, "error: invalid frame rate \"%s\"\n", argv[1]);
+        return 1;
+    }
+    if (quality > 64) quality = 64;
+    uint32_t threshold = 16384u * (quality + 1u);
+    double frame_multiplier = GB_FPS / source_fps;
+    double fps_tracking = 0.0;
+
+    uint8_t luma[SCREEN_SIZE];
+    uint8_t encoded[SCREEN_SIZE];
+    int have_frame = 0;
+    unsigned pictures = 0;
+
+    memset(output, 0xff, sizeof output);
+
     char filepath[1024];
-    printf("GBVP2 Encoder! \n");
-    unsigned long diff = 0;
-    while (true) {
-        bool truncate = false;
-        if (pos / 0x4000 == 0x1FF) {
-            printf("\n\033[1m\033[31mError: This video exceeds 512 banks. Try reducing the quality by setting 'QUALITY' to a higher value.\033[0m\n");
-            truncate = true;
-        }
-        if (scanf("%1023s", filepath) != 1 || truncate) {
-            /* Frames are not allowed to start in bank 0xFF */
-            if (((pos / 0x4000) & 0xFF) == 0xFF) {
-                pos &= ~0x3fff;
-                pos += 0x4000;
-                printf("\n\033[1m\033[33mWarning: This video exceeds 256 banks, it might not be compatible with all flash carts\033[0m\n");
-            }
-            /* Add a restart marker */
-            output[pos++] = 0;
-            FILE *f = fopen(argv[4], "wb");
-            if (!f) {
-                perror("Failed to write output file");
-                return 1;
-            }
-            pos +=  0x3fff;
-            pos &= ~0x3fff;
-            fwrite(output + 0x4000, pos - 0x4000, 1, f);
-            fclose(f);
-            printf("\n");
-            return truncate;
-        }
-        
+    while (scanf("%1023s", filepath) == 1) {
         fps_tracking += frame_multiplier;
-        unsigned frame_length = (unsigned) fps_tracking;
-        if (frame_length == 0) {
-            continue;
-        }
+        unsigned frame_length = (unsigned)fps_tracking;
+        if (frame_length == 0) continue;
         fps_tracking -= frame_length;
+
         FILE *in = fopen(filepath, "rb");
-        fseek(in, 18, SEEK_SET); // Skip header
-        /* Deinterleave the image (easier to process) while computing diff */
-        fread(rgb, sizeof(rgb), 1, in);
-        for (unsigned i = 0; i < SCREEN_SIZE; i++) {
-            diff += abs(b[i] - rgb[i * 3]);
-            diff += abs(g[i] - rgb[i * 3 + 1]);
-            diff += abs(r[i] - rgb[i * 3 + 2]);
-            b[i] = rgb[i * 3];
-            g[i] = rgb[i * 3 + 1];
-            r[i] = rgb[i * 3 + 2];
+        if (!in) {
+            perror(filepath);
+            return 1;
         }
+        int ok = read_tga(in, luma);
         fclose(in);
-        if (id != 0 && diff < DIFF_THRESHOLD && (unsigned)output[frame_count_pos] + frame_length < 0xFF &&
-            (frame_count_pos / 0x4000 != 0xFE)) {
-            output[frame_count_pos] += frame_length;
-            id++;
-            continue;
-        }
-        else {
-            diff = 0;
+        if (!ok) {
+            fprintf(stderr, "error: while reading %s\n", filepath);
+            return 1;
         }
 
-        /* Create shifted image for the blending effect */
-        
-        memcpy(r + SCREEN_SIZE + 3, r, SCREEN_SIZE - 3);
-        memcpy(g + SCREEN_SIZE + 3, g, SCREEN_SIZE - 3);
-        memcpy(b + SCREEN_SIZE + 3, b, SCREEN_SIZE - 3);
-        
-        for (unsigned y = 0; y < 144; y++) {
-            r[y * 160 + SCREEN_SIZE] = r[y * 160 + SCREEN_SIZE + 1] = r[y * 160 + SCREEN_SIZE + 2] = r[y * 160 + SCREEN_SIZE + 3];
-            g[y * 160 + SCREEN_SIZE] = g[y * 160 + SCREEN_SIZE + 1] = g[y * 160 + SCREEN_SIZE + 2] = g[y * 160 + SCREEN_SIZE + 3];
-            b[y * 160 + SCREEN_SIZE] = b[y * 160 + SCREEN_SIZE + 1] = b[y * 160 + SCREEN_SIZE + 2] = b[y * 160 + SCREEN_SIZE + 3];
-        }
-        
-        if (!palette_inited) {
-            for (unsigned i = 0; i < PALETTE_SIZE; i++) {
-                unsigned pixel = rand() % PIXELS;
-                palette[i].r = r[pixel];
-                palette[i].g = g[pixel];
-                palette[i].b = b[pixel];
+        uint32_t diff = 0;
+        uint8_t art_index[SCREEN_H * CELLS];
+        int card = pixel_art ? match_card(luma) : -1;
+        if (card >= 0) {
+            if (last_card == card && have_frame &&
+                (unsigned)output[frame_count_pos] + frame_length <= 255) {
+                output[frame_count_pos] =
+                    (uint8_t)(output[frame_count_pos] + frame_length);
+                continue;
             }
-            palette_inited = true;
+            encode_tile(card_maps + (size_t)card * CARD_MAP, frame_length);
+            last_card = card;
+            have_frame = 1;
+            pictures++;
+            tile_pictures++;
+            printf("\rEncoded picture %u", pictures);
+            fflush(stdout);
+            continue;
         }
-        
-        unsigned i = 128;
-        unsigned score = -1;
-        for (; i--;) {
-            if (!optimize_palette_step(r, g, b, palette, score, &score)) break;
+        if (pixel_art) {
+            for (int y = 0; y < SCREEN_H; y++) {
+                const uint8_t *row = luma + (size_t)y * SCREEN_W;
+                for (int cell = 0; cell < CELLS; cell++) {
+                    uint8_t shades[16];
+                    const uint8_t *px = row + cell * 16;
+                    for (int pixel = 0; pixel < 16; pixel++) {
+                        shades[pixel] = (uint8_t)quantise_art(px[pixel]);
+                    }
+                    int index = cell_code(shades);
+                    art_index[y * CELLS + cell] = (uint8_t)index;
+                    total_cells++;
+                    if (memcmp(shades, codebook[index], 16) == 0) exact_cells++;
+                }
+            }
+        } else if (have_frame) {
+            for (size_t i = 0; i < SCREEN_SIZE; i++) {
+                diff += (uint32_t)abs((int)luma[i] - (int)encoded[i]);
+            }
         }
-        
-        
-        memcpy(rounded_palette, palette, sizeof(palette));
-        round_palette(rounded_palette);
-        /*
-         // For debugging
-        sprintf(filepath, "debug/%04u.tga", id);
-        dump_tga_paletted(filepath, r, g, b, palette);
-        */
-        printf("\rEncoding frame %d       ", id);
-        encode_image(r, g, b, palette, quality, frame_length);
-        id++;
+        int same_art = last_card < 0 && pixel_art && have_frame &&
+            memcmp(art_index, last_index, sizeof art_index) == 0;
+        if (last_card < 0 && have_frame &&
+            (same_art || (!pixel_art && diff <= threshold)) &&
+            (unsigned)output[frame_count_pos] + frame_length <= 254) {
+            output[frame_count_pos] = (uint8_t)(output[frame_count_pos] + frame_length);
+            continue;
+        }
+        if (pixel_art) memcpy(last_index, art_index, sizeof art_index);
+        last_card = -1;
+
+        memcpy(encoded, luma, sizeof encoded);
+        encode_image(encoded, frame_length);
+        have_frame = 1;
+        pictures++;
+        printf("\rEncoded picture %u", pictures);
+        fflush(stdout);
     }
+
+    align_frame();
+    output[pos++] = 0;
+
+    FILE *out = fopen(argv[3], "wb");
+    if (!out) {
+        perror(argv[3]);
+        return 1;
+    }
+    size_t nbytes = pos - 0x4000;
+    if (fwrite(output + 0x4000, 1, nbytes, out) != nbytes) {
+        fprintf(stderr, "error: short write to %s\n", argv[3]);
+        fclose(out);
+        return 1;
+    }
+    fclose(out);
+    printf("\nWrote %u pictures (%u tile cards), %u bytes\n",
+           pictures, tile_pictures, (unsigned)nbytes);
+    if (pixel_art && total_cells) {
+        printf("Exact 16-pixel cells %lu / %lu (%.2f%%)\n",
+               exact_cells, total_cells,
+               100.0 * (double)exact_cells / (double)total_cells);
+    }
+    return 0;
 }
