@@ -5,10 +5,12 @@
  * only while HL is below $7600, leaving 2560 bytes. Layout:
  *   u8  repeat          1-254. 0 ends the stream and the player waits
  *                       for Start. 255 introduces a tile card instead.
- *   u8  flags           bit 0 flips which codebook is on screen
- *   u8  updates         how many hidden-book patches follow
- *   updates * 5 u8      slot, left low, left high, right low, right high
- *   144 * 10 u8         SCY values, one per 16-pixel cell
+ *   u8  flags           reserved, written as 0
+ *   u8  updates         how many pattern patches follow, 0 here
+ *   updates * 6 u8      VRAM address, left low, left high, right low,
+ *                       right high
+ *   144 * 10 u8         SCY values, one per 16-pixel cell. The PIXEL=1
+ *                       stream adds an LCDC byte before each line.
  * A tile card is its own picture and may sit anywhere in the stream:
  *   u8  255
  *   u8  repeat          1-255

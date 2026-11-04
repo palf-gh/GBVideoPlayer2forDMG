@@ -44,12 +44,16 @@ A scroll picture never crosses a bank. The player starts one only below `$7600`:
 | Bytes | Meaning |
 | --- | --- |
 | 1 | How many hardware frames to show, from 1 to 254. `0` ends the stream. Playback returns to the first picture and waits for Start. `255` is not a repeat |
-| 1 | Flags. Bit 0 selects the other codebook before this picture |
-| 1 | How many hidden-codebook patches follow |
-| 5 each | Slot, then the left and right pixel bytes of that 16-pixel pattern |
-| 1440 | 144 lines of 10 scroll values |
+| 1 | Reserved, `0` |
+| 1 | How many pattern patches follow |
+| 6 each | VRAM address of the pattern's left half, then the left and right pixel bytes of that 16-pixel pattern |
+| 1584 | 144 lines. Each line is an LCDC byte, `$91` for book A or `$99` for book B, then 10 scroll values |
 
-Tiles 0–127 hold two codebooks. Patches are written into the hidden one during vertical blank, so a later picture can use a different 256 patterns. A full-screen tile card can stand anywhere in the stream. It is 362 bytes and uses tiles from 128 upwards:
+Tiles 0–63 hold book A and tiles 64–127 hold book B, 256 patterns each. Every line picks its book, so one picture can use up to 512 patterns, although the ten cells of a line share a book. Patches are written during vertical blank, up to 20 per blank, and only into slots that the picture on screen does not draw. The encoder chooses the nearest resident pattern by shade distance, so a cell it cannot match exactly is off by one grey before it is off by two.
+
+The `QUALITY` encoder used without `PIXEL=1` writes 10 scroll values per line and no patches; the player is assembled for whichever stream the build makes.
+
+A full-screen tile card can stand anywhere in the stream. It is 362 bytes and uses tiles from 128 upwards:
 
 | Bytes | Meaning |
 | --- | --- |
@@ -61,7 +65,7 @@ A scroll value of `pattern - line` selects one of the 256 baked 16-pixel pattern
 
 ## Timing
 
-`TUNE_NOPS` in `video.asm` places the scroll writes on the pixel fetch. Each nop slips them four dots later. If a build looks shifted or sliced on hardware, that constant is the adjustment.
+`TUNE_NOPS` in `video.asm` places the scroll writes on the pixel fetch. Each nop slips them four dots later. If a build looks shifted or sliced on hardware, that constant is the adjustment. In the `PIXEL=1` build the LCDC write takes five of those cycles, during mode 2, so the scroll writes stay where they were.
 
 ## Licence
 

@@ -1,9 +1,9 @@
 """Encode four-colour frames with two resident 256-pattern books.
 
-The player can show one book and, during vertical blank, patch the other.
-A source frame therefore keeps the patterns it is already showing and spends
-its blank time installing patterns for the frame that follows. Credits stay
-ordinary tile cards and are left out of the scroll score.
+Each line of a picture picks one book through LCDC, so a picture can draw
+on 512 patterns. During vertical blank the player patches slots that the
+picture on screen does not use, ready for the pictures that follow. Credits
+stay ordinary tile cards and are left out of the scroll score.
 """
 
 import glob
@@ -25,15 +25,19 @@ CANDIDATES = 96
 HORIZON = 6
 # A miss of two or more shades costs this many one-shade misses.
 FAR_STEP = 2
-# Larger than the gain of rewriting the whole horizon, so a pattern the next
-# picture still shows is never the slot that gets replaced.
-KEEP_SENTINEL = 1 << 24
+# A changed cell keeps its previous pattern when that costs at most this
+# much more than the nearest one, so motion does not reshuffle the picture.
+KEEP_SLACK = 2
+FILLER_COST = 16 * FAR_STEP + 1
+LINE_BYTES = 1 + CELLS
+PICTURE_BYTES = SCREEN_H * LINE_BYTES
+PATCH_BYTES = 6
+MAX_UPDATES = (MAX_RECORD - 3 - PICTURE_BYTES) // PATCH_BYTES
+# LCDC for a line drawn from book A (map $9800, tiles 0-63) or book B
+# (map $9C00, tiles 64-127), and where each book's tiles start in VRAM.
+LCDC_OF = (0x91, 0x99)
+BOOK_BASE = (0x8000, 0x8400)
 GB_FPS = (1024.0 * 1024.0 * 4.0) / 70224.0
-
-MISMATCH = bytes(
-    sum(((i >> shift) & 3) != 0 for shift in (0, 2, 4, 6)) for i in range(256)
-)
-
 
 def shade_of(luma):
     if luma >= 220:
@@ -43,16 +47,6 @@ def shade_of(luma):
     if luma >= 80:
         return 2
     return 3
-
-
-def dist(left, right):
-    value = left ^ right
-    return (
-        MISMATCH[value & 255]
-        + MISMATCH[(value >> 8) & 255]
-        + MISMATCH[(value >> 16) & 255]
-        + MISMATCH[(value >> 24) & 255]
-    )
 
 
 def _shade_gap_table():
@@ -76,6 +70,18 @@ def _shade_gap_table():
 
 
 SHADE_NEAR, SHADE_FAR = _shade_gap_table()
+SHADE_COST = bytes(near + FAR_STEP * far for near, far in zip(SHADE_NEAR, SHADE_FAR))
+
+
+def shade_cost(left, right):
+    """Shade-step cost of showing right where left belongs. Two steps cost
+    FAR_STEP, matching what the slot allocator minimises."""
+    return (
+        SHADE_COST[((left >> 16) & 0xFF00) | ((right >> 24) & 255)]
+        + SHADE_COST[((left >> 8) & 0xFF00) | ((right >> 16) & 255)]
+        + SHADE_COST[(left & 0xFF00) | ((right >> 8) & 255)]
+        + SHADE_COST[((left << 8) & 0xFF00) | (right & 255)]
+    )
 
 
 def shade_gap(left, right):
@@ -128,7 +134,6 @@ class Book:
     def __init__(self, patterns):
         self.slots = []
         self.where = {}
-        self.cache = {}
         for pattern in patterns:
             if pattern in self.where or len(self.slots) == 256:
                 continue
@@ -139,57 +144,10 @@ class Book:
             self.slots.append(filler)
             filler += 1
 
-    def cover(self, counter):
-        return sum(count for pattern, count in counter.items() if pattern in self.where)
-
-    def slot_of(self, pattern):
-        found = self.where.get(pattern)
-        if found is not None:
-            return found
-        cached = self.cache.get(pattern)
-        if cached is not None:
-            return cached
-        best = 0
-        best_dist = 99
-        for index, stored in enumerate(self.slots):
-            if stored > 0xFFFFFFFF:
-                continue
-            gap = dist(pattern, stored)
-            if gap < best_dist:
-                best = index
-                best_dist = gap
-                if gap == 0:
-                    break
-        self.cache[pattern] = best
-        return best
-
-    def improve(self, counter, budget):
-        updates = []
-        if budget <= 0:
-            return updates
-        missing = [pattern for pattern, _count in counter.most_common()
-                   if pattern not in self.where]
-        for pattern in missing:
-            if len(updates) >= budget:
-                break
-            slot = min(range(256), key=lambda index: counter.get(self.slots[index], 0))
-            if counter.get(self.slots[slot], 0) >= counter[pattern]:
-                break
-            old = self.slots[slot]
-            if old in self.where and self.where[old] == slot:
-                del self.where[old]
-            self.slots[slot] = pattern
-            self.where[pattern] = slot
-            updates.append((slot, pattern))
-        if updates:
-            self.cache.clear()
-        return updates
-
     def clone(self):
         fresh = Book.__new__(Book)
         fresh.slots = list(self.slots)
         fresh.where = dict(self.where)
-        fresh.cache = {}
         return fresh
 
     def apply(self, writes):
@@ -202,8 +160,6 @@ class Book:
             self.slots[slot] = pattern
             if pattern <= 0xFFFFFFFF:
                 self.where[pattern] = slot
-        if writes:
-            self.cache.clear()
 
 
 def top_patterns(counter, fillers):
@@ -328,47 +284,6 @@ def visible(pattern):
     return pattern
 
 
-def differing(left, right):
-    slots = []
-    for index, (have, want) in enumerate(zip(left.slots, right.slots)):
-        if visible(have) != visible(want):
-            slots.append(index)
-    return slots
-
-
-def scy_of(patterns, book, previous_sources=None, previous=None):
-    """Bytes for one picture. A cell the source left alone keeps what it
-    showed, unless its exact pattern has arrived. A changed cell keeps its
-    previous pattern when that is nearly as close as the best one."""
-    out = bytearray(SCREEN_H * CELLS)
-    shown = [0] * (SCREEN_H * CELLS)
-    exact = 0
-    cursor = 0
-    for y in range(SCREEN_H):
-        for _cell in range(CELLS):
-            pattern = patterns[cursor]
-            resident = book.where.get(pattern)
-            if resident is not None:
-                slot = resident
-                exact += 1
-            elif (previous is not None and previous_sources[cursor] == pattern
-                    and previous[cursor] in book.where):
-                slot = book.where[previous[cursor]]
-            else:
-                slot = book.slot_of(pattern)
-                if previous is not None:
-                    old = previous[cursor]
-                    if old <= 0xFFFFFFFF and old in book.where:
-                        chosen = book.slots[slot]
-                        chosen_gap = 99 if chosen > 0xFFFFFFFF else dist(pattern, chosen)
-                        if dist(pattern, old) <= chosen_gap + 2:
-                            slot = book.where[old]
-            out[cursor] = (slot - y) & 255
-            shown[cursor] = visible(book.slots[slot])
-            cursor += 1
-    return bytes(out), exact, shown
-
-
 def _shades(patterns):
     shifts = (30 - 2 * np.arange(16)).astype(np.uint32)
     return ((patterns[:, None] >> shifts) & np.uint32(3)).astype(np.int16)
@@ -389,6 +304,82 @@ def cost_paired(left, right):
     return _step_cost(delta)
 
 
+def book_gaps(book, patterns):
+    """Cost from each pattern to every slot of book. Unused slots never win."""
+    slots = np.array([visible(pattern) for pattern in book.slots], dtype=np.uint32)
+    gaps = cost_gaps(patterns, slots)
+    filler = np.array([pattern > 0xFFFFFFFF for pattern in book.slots])
+    gaps[:, filler] = FILLER_COST
+    return gaps
+
+
+def render(sources, books, previous):
+    """Choose a book for every line and a slot for every cell.
+
+    The nearest pattern is the one with the least shade-step cost, so a
+    miss of two shades is avoided before a miss of one. A cell whose source
+    is unchanged keeps what it showed, unless its exact pattern is now
+    resident. A changed cell keeps its previous pattern when that is nearly
+    as close as the best one. Each line takes the book that costs less,
+    counting a visible change in an unchanged cell as flicker.
+    """
+    array = np.asarray(sources, dtype=np.uint32)
+    uniq, inverse = np.unique(array, return_inverse=True)
+    nearest = []
+    for book in books:
+        gaps = book_gaps(book, uniq)
+        best = gaps.argmin(axis=1)
+        nearest.append((best[inverse].tolist(),
+                        gaps[np.arange(len(uniq)), best][inverse].tolist()))
+    out = bytearray(PICTURE_BYTES)
+    shown = [0] * (SCREEN_H * CELLS)
+    sides = [0] * SCREEN_H
+    used = (set(), set())
+    exact = 0
+    for y in range(SCREEN_H):
+        start = y * CELLS
+        options = []
+        for side, book in enumerate(books):
+            slots = []
+            cost = 0
+            hits = 0
+            near_slot, near_cost = nearest[side]
+            for cursor in range(start, start + CELLS):
+                pattern = sources[cursor]
+                slot = near_slot[cursor]
+                gap = near_cost[cursor]
+                if gap == 0:
+                    hits += 1
+                elif previous is not None:
+                    old = previous["shown"][cursor]
+                    still = previous["sources"][cursor] == pattern
+                    held = book.where.get(old)
+                    if held is not None:
+                        old_gap = shade_cost(pattern, old)
+                        if still or old_gap <= gap + KEEP_SLACK:
+                            slot = held
+                            gap = old_gap
+                    if still and visible(book.slots[slot]) != old:
+                        gap += FLICKER_COST
+                cost += gap
+                slots.append(slot)
+            options.append((cost, slots, hits))
+        side = previous["sides"][y] if previous is not None else 0
+        if options[1 - side][0] < options[side][0]:
+            side = 1 - side
+        _cost, slots, hits = options[side]
+        exact += hits
+        sides[y] = side
+        line = y * LINE_BYTES
+        out[line] = LCDC_OF[side]
+        book = books[side]
+        for cell, slot in enumerate(slots):
+            out[line + 1 + cell] = (slot - y) & 255
+            shown[start + cell] = visible(book.slots[slot])
+            used[side].add(slot)
+    return bytes(out), exact, {"sources": sources, "shown": shown, "sides": sides}, used
+
+
 def cell_weights(frames):
     """Weigh each cell by how long the source keeps it. A lasting cell shows
     its error for longer; a passing one hides it in the motion."""
@@ -407,50 +398,38 @@ def cell_weights(frames):
     return arrays, weights
 
 
-def improve_by_gain(book, current, displayed, upcoming, weight, budget):
-    """Spend up to budget slots where they remove the most shade error.
+def improve_by_gain(book, protected, current, displayed, upcoming, weight, budget):
+    """Greedily replace slots where that removes the most shade error.
 
-    A miss of two or more shades costs more than a neighbouring shade. The
-    cells of several upcoming pictures are stacked, so a pattern they share
-    outranks one that only the next picture uses. A still run therefore fills
-    its spare slots with the picture that ends the run.
+    The cells are those of several upcoming pictures that are expected to
+    draw from this book, so a pattern they share outranks one that only the
+    next picture uses. Protected slots are on screen and cannot change.
+    Returns (net gain, slot, pattern) per step, applied to book in order.
     """
-    if budget <= 0:
-        return []
+    steps = []
+    if budget <= 0 or not len(upcoming) or protected.all():
+        return steps
     slots = np.array([visible(pattern) for pattern in book.slots], dtype=np.uint32)
     filler = np.array([pattern > 0xFFFFFFFF for pattern in book.slots])
-    shown = np.asarray(displayed, dtype=np.uint32)
-    current = np.asarray(current, dtype=np.uint32)
-    upcoming = np.asarray(upcoming, dtype=np.uint32)
     locked = upcoming == current
-    keep = np.zeros(256)
-    first = SCREEN_H * CELLS
-    for cell in np.nonzero(locked)[0]:
-        slot = book.where.get(int(shown[cell]))
-        if slot is None:
-            continue
-        if cell < first:
-            keep[slot] += KEEP_SENTINEL
-        else:
-            keep[slot] += weight[cell] * FLICKER_COST
+    keep = np.where(protected, np.inf, 0.0)
     uniq, inverse = np.unique(upcoming, return_inverse=True)
     free = ~locked
     free_weight = np.bincount(inverse[free], weights=weight[free], minlength=len(uniq))
-    locked_cost = weight * cost_paired(upcoming, shown)
+    locked_cost = weight * cost_paired(upcoming, displayed)
     locked_gain = np.bincount(inverse[locked], weights=locked_cost[locked], minlength=len(uniq))
     gaps = cost_gaps(uniq, slots)
-    gaps[:, filler] = 16 * FAR_STEP + 1
+    gaps[:, filler] = FILLER_COST
     resident = np.array([int(pattern) in book.where for pattern in uniq])
     candidates = np.nonzero(~resident)[0]
     if not len(candidates):
-        return []
+        return steps
     rows = np.arange(len(uniq))
     nearest = gaps.min(axis=1)
     rough = nearest[candidates] * free_weight[candidates] + locked_gain[candidates]
     candidates = candidates[np.argsort(-rough)[:CANDIDATES]]
     reach = cost_gaps(uniq[candidates], uniq)
-    used = np.zeros(len(candidates), dtype=bool)
-    writes = []
+    taken = np.zeros(len(candidates), dtype=bool)
     limit = 16 * FAR_STEP
     for _step in range(budget):
         part = np.argpartition(gaps, 1, axis=1)
@@ -460,54 +439,26 @@ def improve_by_gain(book, current, displayed, upcoming, weight, budget):
         loss = np.bincount(best, weights=free_weight * (second - first), minlength=256) + keep
         benefit = ((np.maximum(0, first[None, :] - reach) * free_weight[None, :]).sum(axis=1)
                    + locked_gain[candidates])
-        benefit[used] = -1
+        benefit[taken] = -1
         pick = int(np.argmax(benefit))
         victim = int(np.argmin(loss))
-        if benefit[pick] - loss[victim] <= 0:
+        net = benefit[pick] - loss[victim]
+        if not net > 0:
             break
         pattern = int(uniq[candidates[pick]])
         book.apply([(victim, pattern)])
-        writes.append((victim, pattern))
+        steps.append((float(net), victim, pattern))
         gaps[:, victim] = reach[pick]
-        keep[victim] = 0
-        used[pick] = True
-    return writes
+        taken[pick] = True
+    return steps
 
 
-def prepare_hidden(shown, hidden, gain, flip_budget, hold_budget):
-    """Point the off-screen book at a small edit of the one on screen.
+def coming_view(frames, arrays, weights, books, state, index):
+    """Stack the next few scroll pictures behind the one on screen, and
+    guess which book each of their lines will draw from.
 
-    The edit is revealed only when every changed slot fits in the vblanks
-    before the switch. The switch vblank itself stays empty, so the LCDC
-    write happens at the start of vertical blank rather than the end.
-    """
-    stale = differing(hidden, shown)
-    if len(stale) > flip_budget:
-        writes = [(slot, visible(shown.slots[slot])) for slot in stale[:hold_budget]]
-        hidden.apply(writes)
-        return writes, False
-    target = shown.clone()
-    spare = flip_budget - len(stale)
-    gained = improve_by_gain(target, *gain, spare) if spare > 0 else []
-    slots = differing(hidden, target)
-    if gained and len(slots) <= flip_budget:
-        writes = [(slot, visible(target.slots[slot])) for slot in slots]
-        hidden.apply(writes)
-        return writes, True
-    writes = [(slot, visible(shown.slots[slot])) for slot in stale[:hold_budget]]
-    hidden.apply(writes)
-    return writes, False
-
-
-def same_pixels(left, right):
-    return left["patterns"] == right["patterns"]
-
-
-def coming_view(frames, arrays, weights, displayed, index):
-    """Stack the next few scroll pictures behind the one on screen.
-
-    A pattern that keeps occurring outranks a pattern that the next picture
-    alone would spend a slot on. The stack stops at a tile card.
+    A line whose source is unchanged stays on its book. Any other line goes
+    to the book that is closer now. The stack stops at a tile card.
     """
     chosen = []
     ahead = index + 1
@@ -517,43 +468,84 @@ def coming_view(frames, arrays, weights, displayed, index):
         ahead += 1
     if not chosen:
         return None
+    current = arrays[index]
+    displayed = np.asarray(state["shown"], dtype=np.uint32)
+    sides_now = np.asarray(state["sides"], dtype=np.int8)
+    upcoming = np.concatenate([arrays[item] for item in chosen])
+    uniq, inverse = np.unique(upcoming, return_inverse=True)
+    near = [book_gaps(book, uniq).min(axis=1)[inverse] for book in books]
+    cost = np.stack(near).reshape(2, len(chosen), SCREEN_H, CELLS).sum(axis=3)
+    sides = (cost[1] < cost[0]).astype(np.int8)
+    for row, item in enumerate(chosen):
+        still = (arrays[item] == current).reshape(SCREEN_H, CELLS).all(axis=1)
+        sides[row][still] = sides_now[still]
     count = len(chosen)
     return (
-        np.tile(arrays[index], count),
-        np.tile(np.asarray(displayed, dtype=np.uint32), count),
-        np.concatenate([arrays[item] for item in chosen]),
+        np.tile(current, count),
+        np.tile(displayed, count),
+        upcoming,
         np.concatenate([weights[item] for item in chosen]),
+        np.repeat(sides.reshape(-1), CELLS),
     )
 
 
-def build_plans(frames, lengths, fillers):
-    count = len(frames)
-    opening = 1
-    while (opening < count and frames[opening]["card"] < 0
-           and same_pixels(frames[0], frames[opening])):
-        opening += 1
-    book_a = Book(top_patterns(frames[0]["counter"], fillers))
-    if opening < count and frames[opening]["card"] < 0:
-        book_b = Book(top_patterns(frames[opening]["counter"], fillers))
-    else:
-        book_b = Book(top_patterns(frames[0]["counter"], fillers))
-    initial_a = list(book_a.slots)
-    initial_b = list(book_b.slots)
-    arrays, weights = cell_weights(frames)
-    shown = book_a
-    hidden = book_b
-    pending_flip = False
+def allocate(books, used, view, budget):
+    """Spend up to budget patches on the two books, best gain first.
+
+    Each book is planned on its own clone. The two step lists are then
+    merged by gain, and only the chosen prefixes are applied.
+    """
+    if view is None or budget <= 0:
+        return []
+    current, displayed, upcoming, weight, sides = view
     plans = []
-    exact = 0
-    scored = 0
-    flicker = 0
-    stable = 0
-    errors = {
-        "still": 0, "moving": 0, "moving_cells": 0, "fixed": 0,
-        "near": 0, "far": 0,
+    for side, book in enumerate(books):
+        mask = sides == side
+        protected = np.zeros(256, dtype=bool)
+        protected[list(used[side])] = True
+        plans.append(improve_by_gain(
+            book.clone(), protected, current[mask], displayed[mask],
+            upcoming[mask], weight[mask], budget))
+    taken = [0, 0]
+    while taken[0] + taken[1] < budget:
+        heads = [plans[side][taken[side]][0] if taken[side] < len(plans[side]) else 0
+                 for side in (0, 1)]
+        side = 0 if heads[0] >= heads[1] else 1
+        if heads[side] <= 0:
+            break
+        taken[side] += 1
+    writes = []
+    for side in (0, 1):
+        for _net, slot, pattern in plans[side][:taken[side]]:
+            books[side].apply([(slot, pattern)])
+            writes.append((side, slot, pattern))
+    return writes
+
+
+def opening_books(frames, fillers):
+    """Book A holds the first picture. Book B holds what the next pictures
+    need beyond that, then the commonest patterns of the whole stream."""
+    first = Book(top_patterns(frames[0]["counter"], fillers))
+    ahead = Counter()
+    for frame in frames[1:1 + 4 * HORIZON]:
+        if frame["card"] >= 0:
+            break
+        ahead.update(frame["counter"])
+    extra = [pattern for pattern, _count in ahead.most_common() if pattern not in first.where]
+    extra += [pattern for pattern, _count in fillers if pattern not in first.where]
+    return first, Book(extra)
+
+
+def build_plans(frames, lengths, fillers):
+    books = opening_books(frames, fillers)
+    initial = (list(books[0].slots), list(books[1].slots))
+    arrays, weights = cell_weights(frames)
+    plans = []
+    totals = {
+        "exact": 0, "scored": 0, "flicker": 0, "stable": 0, "fixed": 0,
+        "near": 0, "far": 0, "lines_b": 0, "patches": 0,
     }
-    previous_sources = None
-    previous_shown = None
+    state = None
     for index, frame in enumerate(frames):
         if frame["card"] >= 0:
             plans.append({
@@ -561,58 +553,40 @@ def build_plans(frames, lengths, fillers):
                 "card": frame["card"],
                 "length": lengths[index],
             })
-            # The player shows physical book A again. The objects stay tied
-            # to those banks; only the roles change.
-            shown = book_a
-            hidden = book_b
-            pending_flip = False
-            previous_sources = None
-            previous_shown = None
+            state = None
             continue
-        flip = False
-        if pending_flip:
-            shown, hidden = hidden, shown
-            flip = True
-            pending_flip = False
         sources = frame["patterns"]
-        scy, got, displayed = scy_of(sources, shown, previous_sources, previous_shown)
-        exact += got
-        scored += SCREEN_H * CELLS
-        for cursor, (src, new_show) in enumerate(zip(sources, displayed)):
-            wrong = dist(src, new_show)
+        scy, got, fresh, used = render(sources, books, state)
+        totals["exact"] += got
+        totals["scored"] += SCREEN_H * CELLS
+        totals["lines_b"] += sum(fresh["sides"])
+        for cursor, (src, new_show) in enumerate(zip(sources, fresh["shown"])):
             near, far = shade_gap(src, new_show)
-            errors["near"] += near
-            errors["far"] += far
-            if previous_sources is not None and previous_sources[cursor] == src:
-                stable += 1
-                errors["still"] += wrong
-                if previous_shown[cursor] != new_show:
+            totals["near"] += near
+            totals["far"] += far
+            if state is not None and state["sources"][cursor] == src:
+                totals["stable"] += 1
+                if state["shown"][cursor] != new_show:
                     if new_show == src:
-                        errors["fixed"] += 1
+                        totals["fixed"] += 1
                     else:
-                        flicker += 1
-            else:
-                errors["moving_cells"] += 1
-                errors["moving"] += wrong
-        previous_sources = sources
-        previous_shown = displayed
+                        totals["flicker"] += 1
+        state = fresh
         updates = []
-        if index == opening - 1 and opening < count and frames[opening]["card"] < 0:
-            pending_flip = True
-        elif index >= opening and index + 1 < count and frames[index + 1]["card"] < 0:
-            hold_budget = lengths[index] * BPV
-            flip_budget = (lengths[index] - 1) * BPV
-            gain = coming_view(frames, arrays, weights, displayed, index)
-            updates, pending_flip = prepare_hidden(
-                shown, hidden, gain, flip_budget, hold_budget)
+        # The opening picture waits for Start with no patching vblanks.
+        if index > 0:
+            budget = min(lengths[index] * BPV, MAX_UPDATES)
+            view = coming_view(frames, arrays, weights, books, state, index)
+            updates = allocate(books, used, view, budget)
+        totals["patches"] += len(updates)
         plans.append({
             "kind": "scroll",
-            "flip": flip,
             "updates": updates,
             "scy": scy,
             "length": lengths[index],
+            "first": index == 0,
         })
-    return plans, initial_a, initial_b, exact, scored, flicker, stable, errors
+    return plans, initial, totals
 
 
 def merge_plans(plans):
@@ -628,19 +602,19 @@ def merge_plans(plans):
             continue
         previous = merged[-1] if merged else None
         updates = plan["updates"]
-        if (previous and previous["kind"] == "scroll" and not plan["flip"]
+        if (previous and previous["kind"] == "scroll" and not previous["first"]
                 and previous["scy"] == plan["scy"]
                 and previous["length"] + plan["length"] <= 254
-                and len(previous["updates"]) + len(updates) <= 223):
+                and len(previous["updates"]) + len(updates) <= MAX_UPDATES):
             previous["length"] += plan["length"]
             previous["updates"].extend(updates)
             continue
         merged.append({
             "kind": "scroll",
-            "flip": plan["flip"],
             "updates": list(updates),
             "scy": plan["scy"],
             "length": plan["length"],
+            "first": plan["first"],
         })
     return merged
 
@@ -657,10 +631,12 @@ def emit(plans, maps):
         updates = plan["updates"]
         record = bytearray()
         record.append(plan["length"] if plan["length"] <= 254 else 254)
-        record.append(1 if plan["flip"] else 0)
+        record.append(0)
         record.append(len(updates))
-        for slot, pattern in updates:
-            record.append(slot)
+        for side, slot, pattern in updates:
+            address = BOOK_BASE[side] + 2 * slot
+            record.append(address & 255)
+            record.append(address >> 8)
             record.extend(pattern_bytes(pattern))
         record.extend(plan["scy"])
         if len(record) > MAX_RECORD:
@@ -674,19 +650,25 @@ def emit(plans, maps):
 
 
 def check_budgets(plans):
-    """A switch has to be the first thing in its vblank, so the picture
-    before it cannot still be patching when that vblank starts."""
+    """Every patch has to land in one of the picture's own vblanks, in a
+    slot the picture does not draw from."""
     for index, plan in enumerate(plans):
         if plan["kind"] != "scroll":
             continue
-        nxt = plans[index + 1] if index + 1 < len(plans) else None
-        flips_next = nxt is not None and nxt["kind"] == "scroll" and nxt["flip"]
-        cap = (plan["length"] - (1 if flips_next else 0)) * BPV
+        cap = 0 if plan["first"] else min(plan["length"] * BPV, MAX_UPDATES)
         if len(plan["updates"]) > cap:
-            sys.exit(
-                "record %d has %d updates and the next switch allows %d"
-                % (index, len(plan["updates"]), cap)
-            )
+            sys.exit("record %d has %d updates and allows %d"
+                     % (index, len(plan["updates"]), cap))
+        drawn = set()
+        for y in range(SCREEN_H):
+            line = plan["scy"][y * LINE_BYTES:(y + 1) * LINE_BYTES]
+            side = LCDC_OF.index(line[0])
+            for value in line[1:]:
+                drawn.add((side, (value + y) & 255))
+        for side, slot, _pattern in plan["updates"]:
+            if (side, slot) in drawn:
+                sys.exit("record %d patches slot %d of book %d while drawing it"
+                         % (index, slot, side))
 
 
 def main():
@@ -702,8 +684,7 @@ def main():
     card_shades, card_maps = load_cards(cards_path)
     frames, fillers = load_frames(frame_dir, card_shades)
     lengths = frame_lengths(len(frames), rate)
-    plans, book_a, book_b, exact, scored, flicker, stable, errors = build_plans(
-        frames, lengths, fillers.most_common())
+    plans, (book_a, book_b), totals = build_plans(frames, lengths, fillers.most_common())
     merged = merge_plans(plans)
     check_budgets(merged)
     blob = emit(merged, card_maps)
@@ -713,33 +694,30 @@ def main():
     write_include(bookb_path, book_b)
     scrolls = sum(1 for plan in merged if plan["kind"] == "scroll")
     cards = sum(1 for plan in merged if plan["kind"] == "card")
-    flips = sum(1 for plan in merged if plan["kind"] == "scroll" and plan["flip"])
     print(
-        "Wrote %d pictures (%d scroll, %d tile cards, %d book flips), %d bytes"
-        % (scrolls + cards, scrolls, cards, flips, len(blob))
+        "Wrote %d pictures (%d scroll, %d tile cards), %d patches, %d bytes"
+        % (scrolls + cards, scrolls, cards, totals["patches"], len(blob))
     )
+    scored = totals["scored"]
     if scored:
         pixels = scored * 16
-        matched = pixels - errors["near"] - errors["far"]
+        matched = pixels - totals["near"] - totals["far"]
         print(
-            "Exact 16-pixel cells %d / %d (%.2f%%)"
-            % (exact, scored, 100.0 * exact / scored)
+            "Exact 16-pixel cells %d / %d (%.2f%%), lines on book B %.1f%%"
+            % (totals["exact"], scored, 100.0 * totals["exact"] / scored,
+               100.0 * totals["lines_b"] * CELLS / scored)
         )
         print(
             "Matching shades %d / %d (%.2f%%); one step away %d, two or more %d"
             % (matched, pixels, 100.0 * matched / pixels,
-               errors["near"], errors["far"])
+               totals["near"], totals["far"])
         )
-    if stable:
+    if totals["stable"]:
         print(
             "Unchanged cells that switched to another wrong pattern %d / %d (%.2f%%),"
             " corrected to the source %d"
-            % (flicker, stable, 100.0 * flicker / stable, errors["fixed"])
-        )
-        print(
-            "Wrong pixels per 16: unchanged cells %.3f, moving cells %.3f"
-            % (errors["still"] / stable,
-               errors["moving"] / max(1, errors["moving_cells"]))
+            % (totals["flicker"], totals["stable"],
+               100.0 * totals["flicker"] / totals["stable"], totals["fixed"])
         )
 
 

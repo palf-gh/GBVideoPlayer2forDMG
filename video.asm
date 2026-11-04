@@ -8,8 +8,15 @@
 
 INCLUDE "gbhw.asm"
 
-; One hardware frame of picture data. Keep this agreed with encoder.c.
-DEF FRAME_BYTES EQU 1 + 144 * 10
+; One line of picture data. The pixel build starts each line with the
+; LCDC value that picks the book for that line, so one picture can draw
+; from both 256-pattern books. encoder.c writes ten scroll values only.
+IF DEF(CUSTOM_PATTERNS)
+DEF LINE_BYTES EQU 11
+ELSE
+DEF LINE_BYTES EQU 10
+ENDC
+DEF PICTURE_BYTES EQU 144 * LINE_BYTES
 
 ; Mode 2 begins on dot 0 of every visible line. The fastest timer ticks
 ; every 16 T-cycles, and 456 is not a multiple of 16, so the LCD STAT
@@ -20,6 +27,15 @@ DEF FRAME_BYTES EQU 1 + 144 * 10
 ; edges to land on x = 16, 32, 48, ... That is TUNE_NOPS = 12.
 IF !DEF(TUNE_NOPS)
 DEF TUNE_NOPS EQU 12
+ENDC
+; The book select takes five of those cycles and lands in mode 2, before
+; the line's first background fetch.
+DEF BOOK_CYCLES EQU 5
+IF DEF(CUSTOM_PATTERNS)
+ASSERT TUNE_NOPS >= BOOK_CYCLES
+DEF LINE_NOPS EQU TUNE_NOPS - BOOK_CYCLES
+ELSE
+DEF LINE_NOPS EQU TUNE_NOPS
 ENDC
 DEF STAT_MODE2 EQU $20
 
@@ -33,10 +49,9 @@ DEF rom_bank_high EQU $FF86
 ; 1 once Start has been seen released, so a held button cannot replay.
 DEF hold EQU $FF87
 DEF armed EQU $FF88
-; The picture on screen uses one 256-pattern book. Patches land in the other.
+; Pattern patches for slots the picture on screen leaves unused.
 DEF upd_count EQU $FF89
 DEF upd_ptr EQU $FF8A
-DEF hidden_base EQU $FF8C
 DEF lcdc_scroll EQU $FF8D
 DEF map_dirty EQU $FF8E
 DEF upd_batch EQU $FF8F
@@ -49,7 +64,11 @@ DEF PAD_START EQU $08
 SECTION "StatVector", ROM0[$48]
 ; Entered on mode 2. HL is the line, C is rSCY, B counts lines still to show.
 StatLine:
-REPT TUNE_NOPS
+IF DEF(CUSTOM_PATTERNS)
+  ld a, [hli]
+  ldh [rLCDC], a
+ENDC
+REPT LINE_NOPS
   nop
 ENDR
 REPT 10
@@ -82,8 +101,6 @@ BootVideo:
   call LCDOff
   call LoadTiles
   call CreateMap
-  ld a, $84
-  ldh [hidden_base], a
   ld a, $91
   ldh [lcdc_scroll], a
   xor a
@@ -151,8 +168,6 @@ OpenScroll:
   ldh [map_dirty], a
   ld a, $91
   ldh [lcdc_scroll], a
-  ld a, $84
-  ldh [hidden_base], a
   ld b, 144
   ld c, LOW(rSCY)
 .lcd
@@ -313,10 +328,10 @@ FinishedPicture:
   ldh [hold], a
   ldh [armed], a
   ld a, l
-  add a, LOW(1440)
+  add a, LOW(PICTURE_BYTES)
   ld l, a
   ld a, h
-  adc a, HIGH(1440)
+  adc a, HIGH(PICTURE_BYTES)
   ld h, a
   jp .advance
 .startUp
@@ -465,26 +480,11 @@ CreateMap:
   ld b, 64
   jp BuildMap
 
-; A is the repeat and HL points at the flags byte. Leaves HL on the first
-; SCY byte and remembers the hidden-book patches that follow the flags.
+; A is the repeat and HL points at the flags byte, which is reserved.
+; Leaves HL on the first line and remembers the patches that follow.
 PrepareScroll:
   ldh [frame_repeat], a
-  ld a, [hli]
-  bit 0, a
-  jr z, .noflip
-  ldh a, [lcdc_scroll]
-  xor $08
-  ldh [lcdc_scroll], a
-  ldh a, [rLCDC]
-  add a, a
-  jr nc, .flipbase
-  ldh a, [lcdc_scroll]
-  ldh [rLCDC], a
-.flipbase
-  ldh a, [hidden_base]
-  xor $04
-  ldh [hidden_base], a
-.noflip
+  inc hl
   ld a, [hli]
   ldh [upd_count], a
   ld a, l
@@ -492,20 +492,16 @@ PrepareScroll:
   ld a, h
   ldh [upd_ptr+1], a
   ldh a, [upd_count]
-  ld b, a
   ld e, a
-  xor a
-  ld d, a
+  ld d, 0
+  add hl, de
+  add hl, de
+  ld e, a
+  ld d, 0
   sla e
   rl d
   sla e
   rl d
-  ld a, e
-  add a, b
-  ld e, a
-  ld a, d
-  adc a, 0
-  ld d, a
   add hl, de
   ld a, l
   ldh [repeat_sp], a
@@ -517,7 +513,9 @@ PrepareScroll:
   ldh [repeat_bank_high], a
   ret
 
-; Patch up to 20 entries of the hidden book, stopping before line 0.
+; Patch up to 20 patterns, stopping before line 0. Each entry is the VRAM
+; address of the left half, then the low and high bytes of each half.
+; The encoder only names slots that the picture on screen does not use.
 ; HL belongs to the caller. It is this picture's scroll pointer, or the
 ; next record once the last line has been shown. Only the patch walk
 ; borrows it.
@@ -536,19 +534,14 @@ DrainUpdates:
   ld l, a
   ldh a, [upd_ptr+1]
   ld h, a
-  ldh a, [hidden_base]
-  ld c, a
 .one
   ldh a, [rLY]
   cp 153
   jr nc, .save
   ld a, [hli]
-  add a, a
   ld e, a
-  ld d, c
-  jr nc, .left
-  inc d
-.left
+  ld a, [hli]
+  ld d, a
   ld a, [hli]
   ld [de], a
   inc e
