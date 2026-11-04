@@ -19,6 +19,15 @@ SCREEN_H = 144
 CELLS = 10
 BPV = 20
 MAX_RECORD = 2560
+PERSIST_CAP = 8
+FLICKER_COST = 8
+CANDIDATES = 96
+HORIZON = 6
+# A miss of two or more shades costs this many one-shade misses.
+FAR_STEP = 2
+# Larger than the gain of rewriting the whole horizon, so a pattern the next
+# picture still shows is never the slot that gets replaced.
+KEEP_SENTINEL = 1 << 24
 GB_FPS = (1024.0 * 1024.0 * 4.0) / 70224.0
 
 MISMATCH = bytes(
@@ -44,6 +53,39 @@ def dist(left, right):
         + MISMATCH[(value >> 16) & 255]
         + MISMATCH[(value >> 24) & 255]
     )
+
+
+def _shade_gap_table():
+    """For every pair of 4 packed shades, how many differ by one step and
+    how many differ by two or more. One step is the next grey; two steps
+    jumps across a grey and reads as a different shape."""
+    near = bytearray(65536)
+    far = bytearray(65536)
+    for left in range(256):
+        for right in range(256):
+            near_count = 0
+            far_count = 0
+            for shift in (0, 2, 4, 6):
+                gap = abs(((left >> shift) & 3) - ((right >> shift) & 3))
+                near_count += gap == 1
+                far_count += gap >= 2
+            index = (left << 8) | right
+            near[index] = near_count
+            far[index] = far_count
+    return bytes(near), bytes(far)
+
+
+SHADE_NEAR, SHADE_FAR = _shade_gap_table()
+
+
+def shade_gap(left, right):
+    near = 0
+    far = 0
+    for shift in (0, 8, 16, 24):
+        index = (((left >> shift) & 255) << 8) | ((right >> shift) & 255)
+        near += SHADE_NEAR[index]
+        far += SHADE_FAR[index]
+    return near, far
 
 
 def pattern_bytes(pattern):
@@ -294,10 +336,10 @@ def differing(left, right):
     return slots
 
 
-def scy_of(patterns, book, previous=None):
-    """Bytes for one picture. An inexact cell keeps its previous pattern when
-    that pattern is still resident and nearly as close, so a book switch does
-    not reshuffle pixels the source left alone."""
+def scy_of(patterns, book, previous_sources=None, previous=None):
+    """Bytes for one picture. A cell the source left alone keeps what it
+    showed, unless its exact pattern has arrived. A changed cell keeps its
+    previous pattern when that is nearly as close as the best one."""
     out = bytearray(SCREEN_H * CELLS)
     shown = [0] * (SCREEN_H * CELLS)
     exact = 0
@@ -309,6 +351,9 @@ def scy_of(patterns, book, previous=None):
             if resident is not None:
                 slot = resident
                 exact += 1
+            elif (previous is not None and previous_sources[cursor] == pattern
+                    and previous[cursor] in book.where):
+                slot = book.where[previous[cursor]]
             else:
                 slot = book.slot_of(pattern)
                 if previous is not None:
@@ -324,7 +369,112 @@ def scy_of(patterns, book, previous=None):
     return bytes(out), exact, shown
 
 
-def prepare_hidden(shown, hidden, counter, flip_budget, hold_budget):
+def _shades(patterns):
+    shifts = (30 - 2 * np.arange(16)).astype(np.uint32)
+    return ((patterns[:, None] >> shifts) & np.uint32(3)).astype(np.int16)
+
+
+def _step_cost(delta):
+    return np.where(delta >= 2, FAR_STEP, delta).sum(axis=-1).astype(np.int32)
+
+
+def cost_gaps(left, right):
+    """Shade-step cost between every left and right pattern."""
+    delta = np.abs(_shades(left)[:, None, :] - _shades(right)[None, :, :])
+    return _step_cost(delta)
+
+
+def cost_paired(left, right):
+    delta = np.abs(_shades(left) - _shades(right))
+    return _step_cost(delta)
+
+
+def cell_weights(frames):
+    """Weigh each cell by how long the source keeps it. A lasting cell shows
+    its error for longer; a passing one hides it in the motion."""
+    arrays = [np.array(frame["patterns"], dtype=np.uint32) for frame in frames]
+    weights = [None] * len(frames)
+    persist = np.zeros(SCREEN_H * CELLS, dtype=np.int32)
+    for index in range(len(frames) - 1, -1, -1):
+        if frames[index]["card"] >= 0:
+            persist = np.zeros_like(persist)
+            continue
+        if index + 1 < len(frames) and frames[index + 1]["card"] < 0:
+            persist = np.where(arrays[index] == arrays[index + 1], persist + 1, 0)
+        else:
+            persist = np.zeros_like(persist)
+        weights[index] = (1 + np.minimum(persist, PERSIST_CAP)).astype(np.float64)
+    return arrays, weights
+
+
+def improve_by_gain(book, current, displayed, upcoming, weight, budget):
+    """Spend up to budget slots where they remove the most shade error.
+
+    A miss of two or more shades costs more than a neighbouring shade. The
+    cells of several upcoming pictures are stacked, so a pattern they share
+    outranks one that only the next picture uses. A still run therefore fills
+    its spare slots with the picture that ends the run.
+    """
+    if budget <= 0:
+        return []
+    slots = np.array([visible(pattern) for pattern in book.slots], dtype=np.uint32)
+    filler = np.array([pattern > 0xFFFFFFFF for pattern in book.slots])
+    shown = np.asarray(displayed, dtype=np.uint32)
+    current = np.asarray(current, dtype=np.uint32)
+    upcoming = np.asarray(upcoming, dtype=np.uint32)
+    locked = upcoming == current
+    keep = np.zeros(256)
+    first = SCREEN_H * CELLS
+    for cell in np.nonzero(locked)[0]:
+        slot = book.where.get(int(shown[cell]))
+        if slot is None:
+            continue
+        if cell < first:
+            keep[slot] += KEEP_SENTINEL
+        else:
+            keep[slot] += weight[cell] * FLICKER_COST
+    uniq, inverse = np.unique(upcoming, return_inverse=True)
+    free = ~locked
+    free_weight = np.bincount(inverse[free], weights=weight[free], minlength=len(uniq))
+    locked_cost = weight * cost_paired(upcoming, shown)
+    locked_gain = np.bincount(inverse[locked], weights=locked_cost[locked], minlength=len(uniq))
+    gaps = cost_gaps(uniq, slots)
+    gaps[:, filler] = 16 * FAR_STEP + 1
+    resident = np.array([int(pattern) in book.where for pattern in uniq])
+    candidates = np.nonzero(~resident)[0]
+    if not len(candidates):
+        return []
+    rows = np.arange(len(uniq))
+    nearest = gaps.min(axis=1)
+    rough = nearest[candidates] * free_weight[candidates] + locked_gain[candidates]
+    candidates = candidates[np.argsort(-rough)[:CANDIDATES]]
+    reach = cost_gaps(uniq[candidates], uniq)
+    used = np.zeros(len(candidates), dtype=bool)
+    writes = []
+    limit = 16 * FAR_STEP
+    for _step in range(budget):
+        part = np.argpartition(gaps, 1, axis=1)
+        best = part[:, 0]
+        first = gaps[rows, best]
+        second = np.minimum(gaps[rows, part[:, 1]], limit)
+        loss = np.bincount(best, weights=free_weight * (second - first), minlength=256) + keep
+        benefit = ((np.maximum(0, first[None, :] - reach) * free_weight[None, :]).sum(axis=1)
+                   + locked_gain[candidates])
+        benefit[used] = -1
+        pick = int(np.argmax(benefit))
+        victim = int(np.argmin(loss))
+        if benefit[pick] - loss[victim] <= 0:
+            break
+        pattern = int(uniq[candidates[pick]])
+        book.apply([(victim, pattern)])
+        writes.append((victim, pattern))
+        gaps[:, victim] = reach[pick]
+        keep[victim] = 0
+        used[pick] = True
+    return writes
+
+
+def prepare_hidden(shown, hidden, gain, flip_budget, hold_budget):
     """Point the off-screen book at a small edit of the one on screen.
 
     The edit is revealed only when every changed slot fits in the vblanks
@@ -338,11 +488,9 @@ def prepare_hidden(shown, hidden, counter, flip_budget, hold_budget):
         return writes, False
     target = shown.clone()
     spare = flip_budget - len(stale)
-    if spare > 0:
-        target.improve(counter, spare)
+    gained = improve_by_gain(target, *gain, spare) if spare > 0 else []
     slots = differing(hidden, target)
-    if (spare > 0 and len(slots) <= flip_budget
-            and target.cover(counter) > shown.cover(counter)):
+    if gained and len(slots) <= flip_budget:
         writes = [(slot, visible(target.slots[slot])) for slot in slots]
         hidden.apply(writes)
         return writes, True
@@ -353,6 +501,29 @@ def prepare_hidden(shown, hidden, counter, flip_budget, hold_budget):
 
 def same_pixels(left, right):
     return left["patterns"] == right["patterns"]
+
+
+def coming_view(frames, arrays, weights, displayed, index):
+    """Stack the next few scroll pictures behind the one on screen.
+
+    A pattern that keeps occurring outranks a pattern that the next picture
+    alone would spend a slot on. The stack stops at a tile card.
+    """
+    chosen = []
+    ahead = index + 1
+    while (ahead < len(frames) and len(chosen) < HORIZON
+           and frames[ahead]["card"] < 0):
+        chosen.append(ahead)
+        ahead += 1
+    if not chosen:
+        return None
+    count = len(chosen)
+    return (
+        np.tile(arrays[index], count),
+        np.tile(np.asarray(displayed, dtype=np.uint32), count),
+        np.concatenate([arrays[item] for item in chosen]),
+        np.concatenate([weights[item] for item in chosen]),
+    )
 
 
 def build_plans(frames, lengths, fillers):
@@ -368,6 +539,7 @@ def build_plans(frames, lengths, fillers):
         book_b = Book(top_patterns(frames[0]["counter"], fillers))
     initial_a = list(book_a.slots)
     initial_b = list(book_b.slots)
+    arrays, weights = cell_weights(frames)
     shown = book_a
     hidden = book_b
     pending_flip = False
@@ -376,6 +548,10 @@ def build_plans(frames, lengths, fillers):
     scored = 0
     flicker = 0
     stable = 0
+    errors = {
+        "still": 0, "moving": 0, "moving_cells": 0, "fixed": 0,
+        "near": 0, "far": 0,
+    }
     previous_sources = None
     previous_shown = None
     for index, frame in enumerate(frames):
@@ -399,17 +575,25 @@ def build_plans(frames, lengths, fillers):
             flip = True
             pending_flip = False
         sources = frame["patterns"]
-        scy, got, displayed = scy_of(sources, shown, previous_shown)
+        scy, got, displayed = scy_of(sources, shown, previous_sources, previous_shown)
         exact += got
         scored += SCREEN_H * CELLS
-        if previous_sources is not None:
-            for src, old_src, old_show, new_show in zip(
-                    sources, previous_sources, previous_shown, displayed):
-                if src != old_src:
-                    continue
+        for cursor, (src, new_show) in enumerate(zip(sources, displayed)):
+            wrong = dist(src, new_show)
+            near, far = shade_gap(src, new_show)
+            errors["near"] += near
+            errors["far"] += far
+            if previous_sources is not None and previous_sources[cursor] == src:
                 stable += 1
-                if old_show != new_show:
-                    flicker += 1
+                errors["still"] += wrong
+                if previous_shown[cursor] != new_show:
+                    if new_show == src:
+                        errors["fixed"] += 1
+                    else:
+                        flicker += 1
+            else:
+                errors["moving_cells"] += 1
+                errors["moving"] += wrong
         previous_sources = sources
         previous_shown = displayed
         updates = []
@@ -418,8 +602,9 @@ def build_plans(frames, lengths, fillers):
         elif index >= opening and index + 1 < count and frames[index + 1]["card"] < 0:
             hold_budget = lengths[index] * BPV
             flip_budget = (lengths[index] - 1) * BPV
+            gain = coming_view(frames, arrays, weights, displayed, index)
             updates, pending_flip = prepare_hidden(
-                shown, hidden, frames[index + 1]["counter"], flip_budget, hold_budget)
+                shown, hidden, gain, flip_budget, hold_budget)
         plans.append({
             "kind": "scroll",
             "flip": flip,
@@ -427,7 +612,7 @@ def build_plans(frames, lengths, fillers):
             "scy": scy,
             "length": lengths[index],
         })
-    return plans, initial_a, initial_b, exact, scored, flicker, stable
+    return plans, initial_a, initial_b, exact, scored, flicker, stable, errors
 
 
 def merge_plans(plans):
@@ -517,7 +702,7 @@ def main():
     card_shades, card_maps = load_cards(cards_path)
     frames, fillers = load_frames(frame_dir, card_shades)
     lengths = frame_lengths(len(frames), rate)
-    plans, book_a, book_b, exact, scored, flicker, stable = build_plans(
+    plans, book_a, book_b, exact, scored, flicker, stable, errors = build_plans(
         frames, lengths, fillers.most_common())
     merged = merge_plans(plans)
     check_budgets(merged)
@@ -534,14 +719,27 @@ def main():
         % (scrolls + cards, scrolls, cards, flips, len(blob))
     )
     if scored:
+        pixels = scored * 16
+        matched = pixels - errors["near"] - errors["far"]
         print(
             "Exact 16-pixel cells %d / %d (%.2f%%)"
             % (exact, scored, 100.0 * exact / scored)
         )
+        print(
+            "Matching shades %d / %d (%.2f%%); one step away %d, two or more %d"
+            % (matched, pixels, 100.0 * matched / pixels,
+               errors["near"], errors["far"])
+        )
     if stable:
         print(
-            "Unchanged cells that switched pattern %d / %d (%.2f%%)"
-            % (flicker, stable, 100.0 * flicker / stable)
+            "Unchanged cells that switched to another wrong pattern %d / %d (%.2f%%),"
+            " corrected to the source %d"
+            % (flicker, stable, 100.0 * flicker / stable, errors["fixed"])
+        )
+        print(
+            "Wrong pixels per 16: unchanged cells %.3f, moving cells %.3f"
+            % (errors["still"] / stable,
+               errors["moving"] / max(1, errors["moving_cells"]))
         )
 
 
